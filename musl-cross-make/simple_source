@@ -1,0 +1,153 @@
+#!/bin/bash
+
+# Discover latest release names for gcc and binutils from sourceware, and
+# populate a small list of GNU mirrors to probe for assets.
+versions() {
+	local primary_root="https://sourceware.org/pub"
+	local fallback_root="https://mirrorservice.org/sites/sourceware.org/pub"
+	local apps=("gcc" "binutils")
+
+	# Reset globals for latest version names
+	gcc_version_name=""
+	binutils_version_name=""
+
+	for an in "${apps[@]}"; do
+		local latest
+		# Try sourceware first, fall back to mirrorservice if it fails or yields nothing.
+		local list_url_primary="${primary_root}/${an}/releases"
+		local list_url_fallback="${fallback_root}/${an}/releases"
+		local content
+		content=$(curl -sS -L --connect-timeout 5 --max-time 15 "$list_url_primary" 2> /dev/null) || content=""
+		if [[ -z $content ]]; then
+			content=$(curl -sS -L --connect-timeout 5 --max-time 15 "$list_url_fallback" 2> /dev/null) || content=""
+		fi
+
+		if [[ $an == "gcc" ]]; then
+			# gcc has per-version directories, e.g., gcc-15.2.0/
+			latest=$(printf '%s' "$content" \
+				| sed -rn "s#.*href=\"(${an}-[0-9]+(\.[0-9]+){1,2})/\".*#\1#p" \
+				| sort -V -r | head -n1)
+			gcc_version_name="$latest"
+		else
+			# binutils lists tarballs directly, e.g., binutils-2.45.tar.xz
+			# Extract name-version without the archive extension.
+			latest=$(printf '%s' "$content" \
+				| sed -rn "s#.*href=\"(${an}-[0-9]+(\.[0-9]+){1,2})\.tar\.(xz|gz)\".*#\1#p" \
+				| sort -V -r | head -n1)
+			binutils_version_name="$latest"
+		fi
+		# Keep silent: do not print discovered versions.
+	done
+
+	# general mirrors we will use (ensure bases include the gnu path where needed)
+	source_urls=(
+		"https://ftp.gnu.org/gnu"
+		"https://ftpmirror.gnu.org/gnu"
+		"https://mirrors.dotsrc.org/gnu"
+		"https://ftp.snt.utwente.nl/pub/software/gnu"
+	)
+}
+
+# Small helper: returns 0 if URL responds with 2xx/3xx (HEAD with GET fallback), else 1.
+http_ok() {
+	local url="$1"
+	local code
+	code=$(curl -sS -I -L --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' "$url" 2> /dev/null) || code="000"
+	if [[ $code != 2* && $code != 3* ]]; then
+		code=$(curl -sS -L --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' "$url" 2> /dev/null) || code="000"
+	fi
+	if [[ $code == 2* || $code == 3* ]]; then
+		return 0
+	fi
+	return 1
+}
+
+# Argument handling
+# - If first arg is a URL (http/https), treat it as a preferred mirror (validate later).
+# - Else, if args include gcc/binutils tokens, print versions only and exit.
+preferred_mirror=""
+if [[ $# -gt 0 ]]; then
+	if [[ $1 =~ ^https?:// ]]; then
+		preferred_mirror="${1%/}"
+	else
+		versions || exit 1
+		printed=0
+		for a in "$@"; do
+			case "$a" in
+				gcc)
+					if [[ -n $gcc_version_name ]]; then
+						printf '%s\n' "${gcc_version_name#gcc-}"
+						printed=1
+					fi
+					;;
+				binutils)
+					if [[ -n $binutils_version_name ]]; then
+						printf '%s\n' "${binutils_version_name#binutils-}"
+						printed=1
+					fi
+					;;
+			esac
+		done
+		if [[ $printed -eq 1 ]]; then
+			exit 0
+		fi
+		exit 1
+	fi
+fi
+
+# Linear selection: check each mirror (base), then both assets; stop at first success.
+find_working_mirror() {
+	# Ensure versions are known
+	if [[ -z $gcc_version_name || -z $binutils_version_name ]]; then
+		versions || return 1
+	fi
+
+	local gcc_rel="gcc/${gcc_version_name}/${gcc_version_name}.tar.xz"
+	local binutils_rel="binutils/${binutils_version_name}.tar.xz"
+
+	# If a preferred mirror was provided, try it first.
+	if [[ -n $preferred_mirror ]]; then
+		local m="$preferred_mirror"
+		if http_ok "${m}/"; then
+			local gcc_url_p="${m}/${gcc_rel}"
+			local bu_url_p="${m}/${binutils_rel}"
+			if http_ok "$gcc_url_p" && http_ok "$bu_url_p"; then
+				mirror_url="$m"
+				return 0
+			fi
+		fi
+		# Fall through to array scan if preferred failed.
+	fi
+
+	for mirror in "${source_urls[@]}"; do
+		# Check the mirror base first (linear order)
+		if ! http_ok "${mirror}/"; then
+			continue
+		fi
+
+		# Check both assets on this mirror
+		local gcc_url="${mirror}/${gcc_rel}"
+		local bu_url="${mirror}/${binutils_rel}"
+		local gcc_ok=1 bu_ok=1
+		if ! http_ok "$gcc_url"; then gcc_ok=0; fi
+		if ! http_ok "$bu_url"; then bu_ok=0; fi
+
+		if [[ $gcc_ok -eq 1 && $bu_ok -eq 1 ]]; then
+			mirror_url="$mirror"
+			return 0
+		fi
+		# Try next mirror in linear order
+	done
+
+	printf '%s\n' "no mirror provided both assets (gcc: ${gcc_version_name}, binutils: ${binutils_version_name})" >&2
+	return 1
+}
+
+# One-pass selection over mirrors: for each mirror, check mirror base first,
+# then check assets for gcc and binutils. Stop as soon as each asset is found;
+# returns success only if both are resolved.
+
+versions
+find_working_mirror || exit 1
+# No-op reference to satisfy linters when sourcing; does not print or change behavior.
+printf '%s\n' "${mirror_url}"
