@@ -312,7 +312,7 @@ _dh() {
 			docker rm -f "${container_name}" > /dev/null 2>&1 || true
 		fi
 		# Attempt to remove image by tag; ignore errors if not present or in use
-		printf '%b %s\n' "${unicode_blue_circle}" "Removing image '${image_type}:${image_version}' (if present)..."
+		printf '%b %s\n\n' "${unicode_blue_circle}" "Removing image '${image_type}:${image_version}' (if present)..."
 		docker rmi -f "${image_type}:${image_version}" > /dev/null 2>&1 || true
 		# Ensure we create a fresh container
 		force_new=true
@@ -387,39 +387,39 @@ _dh() {
 			if [[ ${use_sudo} == true ]]; then
 				# Build the container setup script (Ubuntu/Debian, sudo mode) as a readable heredoc
 				container_cmd=$(
-					cat << 'CONTAINER_SH'
-				export PATH=/usr/sbin:/sbin:$PATH
-				. /etc/os-release 2>/dev/null || true
-				noble=
-				if [ "${ID}" = ubuntu ] && dpkg --compare-versions "${VERSION_ID}" ge 24.04; then
-				  noble=1
-				fi
-				apt-get update && apt-get install -y sudo passwd && {
-				  if id gh >/dev/null 2>&1; then
-				    :
-				  elif [ -n "$noble" ]; then
-				    if id user >/dev/null 2>&1; then
-				      { getent group user >/dev/null 2>&1 && groupmod -n gh user || true; }
-				      usermod -l gh user
-				      if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
-				    else
-				      uid_user=$(getent passwd 1000 | cut -d: -f1)
-				      if [ -n "$uid_user" ] && [ "$uid_user" != gh ]; then
-				        { getent group "$uid_user" >/dev/null 2>&1 && groupmod -n gh "$uid_user" || true; }
-				        usermod -l gh "$uid_user"
-				        if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
-				      else
-				        useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
-				      fi
-				    fi
-				  else
-				    useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
-				  fi
-				} && printf "%s\n" "gh ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/gh \
-				&& chmod 0440 /etc/sudoers.d/gh \
-				&& exec sudo -u gh bash
+					cat <<- 'CONTAINER_SH'
+						export PATH=/usr/sbin:/sbin:$PATH
+						. /etc/os-release 2>/dev/null || true
+						noble=
+						if [ "${ID}" = ubuntu ] && dpkg --compare-versions "${VERSION_ID}" ge 24.04; then
+						  noble=1
+						fi
+						apt-get update && apt-get install -y sudo passwd && {
+						  if id gh >/dev/null 2>&1; then
+						    :
+						  elif [ -n "$noble" ]; then
+						    if id user >/dev/null 2>&1; then
+						      { getent group user >/dev/null 2>&1 && groupmod -n gh user || true; }
+						      usermod -l gh user
+						      if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
+						    else
+						      uid_user=$(getent passwd 1000 | cut -d: -f1)
+						      if [ -n "$uid_user" ] && [ "$uid_user" != gh ]; then
+						        { getent group "$uid_user" >/dev/null 2>&1 && groupmod -n gh "$uid_user" || true; }
+						        usermod -l gh "$uid_user"
+						        if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
+						      else
+						        useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
+						      fi
+						    fi
+						  else
+						    useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
+						  fi
+						} && printf "%s\n" "gh ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/gh \
+						&& chmod 0440 /etc/sudoers.d/gh \
+						&& exec sudo -u gh bash
 
-CONTAINER_SH
+					CONTAINER_SH
 				)
 				${docker_cmd} \
 					-w /home/gh \
@@ -430,37 +430,37 @@ CONTAINER_SH
 			elif [[ ${use_limited} == true ]]; then
 				# Build the container setup script (Ubuntu/Debian, limited mode) as a readable heredoc
 				container_cmd=$(
-					cat << 'CONTAINER_SH'
-				export PATH=/usr/sbin:/sbin:$PATH
-				. /etc/os-release 2>/dev/null || true
-				noble=
-				if [ "${ID}" = ubuntu ] && dpkg --compare-versions "${VERSION_ID}" ge 24.04; then
-				  noble=1
-				fi
-				apt-get update && apt-get install -y passwd && {
-				  if id gh >/dev/null 2>&1; then
-				    :
-				  elif [ -n "$noble" ]; then
-				    if id user >/dev/null 2>&1; then
-				      { getent group user >/dev/null 2>&1 && groupmod -n gh user || true; }
-				      usermod -l gh user
-				      if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
-				    else
-				      uid_user=$(getent passwd 1000 | cut -d: -f1)
-				      if [ -n "$uid_user" ] && [ "$uid_user" != gh ]; then
-				        { getent group "$uid_user" >/dev/null 2>&1 && groupmod -n gh "$uid_user" || true; }
-				        usermod -l gh "$uid_user"
-				        if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
-				      else
-				        useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
-				      fi
-				    fi
-				  else
-				    useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
-				  fi
-				} && exec su - gh
+					cat <<- 'CONTAINER_SH'
+						export PATH=/usr/sbin:/sbin:$PATH
+						. /etc/os-release 2>/dev/null || true
+						noble=
+						if [ "${ID}" = ubuntu ] && dpkg --compare-versions "${VERSION_ID}" ge 24.04; then
+						  noble=1
+						fi
+						apt-get update && apt-get install -y passwd && {
+						  if id gh >/dev/null 2>&1; then
+						    :
+						  elif [ -n "$noble" ]; then
+						    if id user >/dev/null 2>&1; then
+						      { getent group user >/dev/null 2>&1 && groupmod -n gh user || true; }
+						      usermod -l gh user
+						      if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
+						    else
+						      uid_user=$(getent passwd 1000 | cut -d: -f1)
+						      if [ -n "$uid_user" ] && [ "$uid_user" != gh ]; then
+						        { getent group "$uid_user" >/dev/null 2>&1 && groupmod -n gh "$uid_user" || true; }
+						        usermod -l gh "$uid_user"
+						        if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
+						      else
+						        useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
+						      fi
+						    fi
+						  else
+						    useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
+						  fi
+						} && exec su - gh
 
-CONTAINER_SH
+					CONTAINER_SH
 				)
 				${docker_cmd} \
 					-w /home/gh \
@@ -493,30 +493,30 @@ CONTAINER_SH
 			# Use a readable script for Ubuntu/Debian user rename/create logic
 			local persist_setup_script
 			persist_setup_script=$(
-				cat << 'CONTAINER_SH'
-			export PATH=/usr/sbin:/sbin:$PATH
-			. /etc/os-release 2>/dev/null || true
-			if id gh >/dev/null 2>&1; then
-			  :
-			elif [ "${ID}" = ubuntu ] && dpkg --compare-versions "${VERSION_ID}" ge 24.04; then
-			  if id user >/dev/null 2>&1; then
-			    { getent group user >/dev/null 2>&1 && groupmod -n gh user || true; }
-			    usermod -l gh user
-			    if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
-			  else
-			    uid_user=$(getent passwd 1000 | cut -d: -f1)
-			    if [ -n "$uid_user" ] && [ "$uid_user" != gh ]; then
-			      { getent group "$uid_user" >/dev/null 2>&1 && groupmod -n gh "$uid_user" || true; }
-			      usermod -l gh "$uid_user"
-			      if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
-			    else
-			      useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
-			    fi
-			  fi
-			else
-			  useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
-			fi
-CONTAINER_SH
+				cat <<- 'CONTAINER_SH'
+					export PATH=/usr/sbin:/sbin:$PATH
+					. /etc/os-release 2>/dev/null || true
+					if id gh >/dev/null 2>&1; then
+					  :
+					elif [ "${ID}" = ubuntu ] && dpkg --compare-versions "${VERSION_ID}" ge 24.04; then
+					  if id user >/dev/null 2>&1; then
+					    { getent group user >/dev/null 2>&1 && groupmod -n gh user || true; }
+					    usermod -l gh user
+					    if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
+					  else
+					    uid_user=$(getent passwd 1000 | cut -d: -f1)
+					    if [ -n "$uid_user" ] && [ "$uid_user" != gh ]; then
+					      { getent group "$uid_user" >/dev/null 2>&1 && groupmod -n gh "$uid_user" || true; }
+					      usermod -l gh "$uid_user"
+					      if [ ! -d /home/gh ]; then usermod -d /home/gh -m gh; else usermod -d /home/gh gh; fi
+					    else
+					      useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
+					    fi
+					  fi
+					else
+					  useradd -ms /bin/bash -u 1000 gh 2>/dev/null || useradd -ms /bin/bash gh
+					fi
+				CONTAINER_SH
 			)
 			docker exec "${container_name}" sh -lc "${persist_setup_script}"
 			# Ensure home exists and owned by gh
