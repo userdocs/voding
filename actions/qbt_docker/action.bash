@@ -135,60 +135,60 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 	case "$inputs_os_id" in
 		alpine | */alpine)
 			log_info "Creating Alpine Linux Dockerfile"
-			cat > "$dockerfile_path" <<- EOF
-				FROM ${inputs_os_id}:${inputs_os_version_id}
-
-				# Create group and user
-				RUN addgroup -g ${new_gid} ${new_user_name} 2>/dev/null || true && \\
-				    adduser -h /home/${new_user_name} -Ds /bin/bash -u ${new_uid} -G ${new_user_name} ${new_user_name}
-
-				# Update packages and install dependencies
-				RUN apk update --no-cache && \\
-				    apk add -u --no-cache sudo bash ${inputs_additional_alpine_apps} && \\
-				    apk upgrade --no-cache
-
-				# Configure sudo access
-				RUN umask 077 && \\
-				    printf '%s\\n' "${new_user_name} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${new_user_name} && \\
-				    chmod 0440 /etc/sudoers.d/${new_user_name}
-			EOF
+			printf '%s\n' \
+				"FROM ${inputs_os_id}:${inputs_os_version_id}" \
+				"" \
+				"# Create group and user" \
+				"RUN addgroup -g ${new_gid} ${new_user_name} 2>/dev/null || true && \\" \
+				"    adduser -h /home/${new_user_name} -Ds /bin/bash -u ${new_uid} -G ${new_user_name} ${new_user_name}" \
+				"" \
+				"# Update packages and install dependencies" \
+				'RUN apk update --no-cache && \' \
+				"    apk add -u --no-cache sudo bash ${inputs_additional_alpine_apps} && \\" \
+				"    apk upgrade --no-cache" \
+				"" \
+				"# Configure sudo access" \
+				'RUN umask 077 && \' \
+				"    printf '%s\\n' \"${new_user_name} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${new_user_name} && \\" \
+				"    chmod 0440 /etc/sudoers.d/${new_user_name}" \
+				> "$dockerfile_path"
 			;;
 		debian | */debian | ubuntu | */ubuntu)
 			log_info "Creating Debian/Ubuntu Dockerfile"
-			cat > "$dockerfile_path" <<- EOF
-				FROM ${inputs_os_id}:${inputs_os_version_id}
-
-				# Create group and user
-				RUN groupadd -g ${new_gid} ${new_user_name} 2>/dev/null || true && \\
-				    useradd -ms /bin/bash -u ${new_uid} -g ${new_gid} ${new_user_name}
-
-				# Update packages and install dependencies
-				RUN apt-get update && \\
-				    apt-get install -y sudo ${inputs_additional_debian_apps} && \\
-				    apt-get upgrade -y
-
-				# Configure sudo access
-				RUN umask 077 && \\
-				    printf '%s\\n' "${new_user_name} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${new_user_name} && \\
-				    chmod 0440 /etc/sudoers.d/${new_user_name}
-			EOF
+			printf '%s\n' \
+				"FROM ${inputs_os_id}:${inputs_os_version_id}" \
+				"" \
+				"# Create group and user" \
+				"RUN groupadd -g ${new_gid} ${new_user_name} 2>/dev/null || true && \\" \
+				"    useradd -ms /bin/bash -u ${new_uid} -g ${new_gid} ${new_user_name}" \
+				"" \
+				"# Update packages and install dependencies" \
+				'RUN apt-get update && \' \
+				"    apt-get install -y sudo ${inputs_additional_debian_apps} && \\" \
+				"    apt-get upgrade -y" \
+				"" \
+				"# Configure sudo access" \
+				'RUN umask 077 && \' \
+				"    printf '%s\\n' \"${new_user_name} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${new_user_name} && \\" \
+				"    chmod 0440 /etc/sudoers.d/${new_user_name}" \
+				> "$dockerfile_path"
 			;;
 		*)
 			log_info "Creating basic Dockerfile for unsupported OS: $inputs_os_id"
-			cat > "$dockerfile_path" <<- EOF
-				FROM ${inputs_os_id}:${inputs_os_version_id}
-
-				# Create group and user (basic fallback)
-				RUN groupadd ${new_user_name} 2>/dev/null || addgroup ${new_user_name} 2>/dev/null || true && \\
-				    useradd -ms /bin/bash ${new_user_name} 2>/dev/null || adduser -h /home/${new_user_name} -Ds /bin/bash ${new_user_name} 2>/dev/null || true
-
-				# Configure sudo access if sudo exists
-				RUN if command -v sudo >/dev/null 2>&1; then \\
-				        umask 077 && \\
-				        printf '%s\\n' "${new_user_name} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${new_user_name} && \\
-				        chmod 0440 /etc/sudoers.d/${new_user_name}; \\
-				    fi
-			EOF
+			printf '%s\n' \
+				"FROM ${inputs_os_id}:${inputs_os_version_id}" \
+				"" \
+				"# Create group and user (basic fallback)" \
+				"RUN groupadd ${new_user_name} 2>/dev/null || addgroup ${new_user_name} 2>/dev/null || true && \\" \
+				"    useradd -ms /bin/bash ${new_user_name} 2>/dev/null || adduser -h /home/${new_user_name} -Ds /bin/bash ${new_user_name} 2>/dev/null || true" \
+				"" \
+				"# Configure sudo access if sudo exists" \
+				'RUN if command -v sudo >/dev/null 2>&1; then \' \
+				'        umask 077 && \' \
+				"        printf '%s\\n' \"${new_user_name} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${new_user_name} && \\" \
+				"        chmod 0440 /etc/sudoers.d/${new_user_name}; \\" \
+				"    fi" \
+				> "$dockerfile_path"
 			;;
 	esac
 
