@@ -137,7 +137,7 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 	case "$inputs_os_id" in
 		alpine | */alpine)
 			log_info "Setting up Alpine Linux container"
-			docker exec -w "/" "$inputs_container_name" sh -c "adduser -h /home/${new_user_name} -Ds /bin/bash -u ${new_uid} -G ${new_gid} ${new_user_name}" || {
+			docker exec -w "/" "$inputs_container_name" sh -c "addgroup -g ${new_gid} ${new_user_name} 2>/dev/null || true; adduser -h /home/${new_user_name} -Ds /bin/bash -u ${new_uid} -G ${new_user_name} ${new_user_name}" || {
 				log_error "Failed to create user in Alpine container"
 				exit 1
 			}
@@ -150,7 +150,7 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 			;;
 		debian | */debian | ubuntu | */ubuntu)
 			log_info "Setting up Debian/Ubuntu container"
-			docker exec -w "/" "$inputs_container_name" sh -c "useradd -ms /bin/bash -u ${new_uid} -g ${new_gid} ${new_user_name}" || {
+			docker exec -w "/" "$inputs_container_name" sh -c "groupadd -g ${new_gid} ${new_user_name} 2>/dev/null || true; useradd -ms /bin/bash -u ${new_uid} -g ${new_gid} ${new_user_name}" || {
 				log_error "Failed to create user in Debian/Ubuntu container"
 				exit 1
 			}
