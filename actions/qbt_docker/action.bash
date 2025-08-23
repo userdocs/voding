@@ -26,11 +26,49 @@ log_debug() {
 	printf '[DEBUG] %s\n' "$1"
 }
 
-# Fast-path: if the user supplied a Dockerfile, ignore other inputs and only
-# fetch/validate/build that Dockerfile and emit minimal outputs. Placing this
-# check here (immediately after function defs) ensures no other processing
-# occurs (including debug prints, env merging, docker_command construction)
-# when a Dockerfile is provided.
+# Debug: Print all input variables
+log_debug "Input variables:"
+log_debug "  inputs_use_host_env='$inputs_use_host_env'"
+log_debug "  inputs_uid='$inputs_uid'"
+log_debug "  inputs_gid='$inputs_gid'"
+log_debug "  inputs_container_name='$inputs_container_name'"
+log_debug "  inputs_os_id='$inputs_os_id'"
+log_debug "  inputs_os_version_id='$inputs_os_version_id'"
+log_debug "  inputs_custom_docker_commands='$inputs_custom_docker_commands'"
+log_debug "  inputs_additional_alpine_apps='$inputs_additional_alpine_apps'"
+log_debug "  inputs_additional_debian_apps='$inputs_additional_debian_apps'"
+log_debug "  workspace='$workspace'"
+
+# start creating our base docker command
+docker_command=("run" "-it" "-d" "--name" "$inputs_container_name")
+
+# Parse the custom docker commands string into an array
+read -ra inputs_custom_docker_commands_array <<< "$inputs_custom_docker_commands"
+
+if [[ -f "${workspace}/env.host" && -f "${workspace}/env.custom" ]]; then
+	cat "${workspace}/env.host" "${workspace}/env.custom" > "${workspace}/env.load"
+	env_custom="host + custom"
+elif [[ -f "${workspace}/env.host" && ! -f "${workspace}/env.custom" ]]; then
+	cat "${workspace}/env.host" > "${workspace}/env.load"
+	env_custom="host only"
+elif [[ ! -f "${workspace}/env.host" && -f "${workspace}/env.custom" ]]; then
+	cat "${workspace}/env.custom" > "${workspace}/env.load"
+	env_custom="custom only"
+else
+	env_custom="none"
+fi
+
+# Only add env-file if merged file exists
+if [[ -f "${workspace}/env.load" ]]; then
+	docker_command+=("--env-file" "${workspace}/env.load")
+fi
+
+# Fast-path: if the user supplied a Dockerfile, ignore other inputs except env related
+# and only fetch/validate/build that Dockerfile and emit minimal outputs. Placing this
+# check here (immediately after function defs) ensures no other processing occurs
+# (including debug prints, env merging, docker_command construction) when a Dockerfile is provided.
+# We assume the dockerfile is configured as desired and do no configuration of it other
+# than to load the env files if present.
 if [[ -n $inputs_dockerfile ]]; then
 	dockerfile_path="${workspace}/Dockerfile.custom"
 	log_info "Fast-path: using provided Dockerfile: $inputs_dockerfile"
@@ -75,8 +113,7 @@ if [[ -n $inputs_dockerfile ]]; then
 	} >> "$GITHUB_STEP_SUMMARY"
 
 	# Build with a simple predictable tag
-	custom_image_tag="builder"
-	container_name="builder"
+	custom_image_tag="custom_dockerfile"
 
 	log_info "Building image from provided Dockerfile as: $custom_image_tag"
 	docker build -f "$dockerfile_path" -t "$custom_image_tag" . || {
@@ -86,9 +123,11 @@ if [[ -n $inputs_dockerfile ]]; then
 		exit 1
 	}
 
+	docker_command+=("$custom_image_tag")
+
 	# Start a container (detached) from the built image so it's running like a daemon.
-	log_info "Starting container from image '$custom_image_tag' as '$container_name' (detached)"
-	docker run -d --name "$container_name" "$custom_image_tag" || {
+	log_info "Starting container from image '$custom_image_tag' as '$inputs_container_name' (detached)"
+	docker "${docker_command[@]}" || {
 		log_error "Failed to start container from image $custom_image_tag"
 		rm -f "$dockerfile_path"
 		exit 1
@@ -98,33 +137,19 @@ if [[ -n $inputs_dockerfile ]]; then
 	rm -f "$dockerfile_path"
 
 	{
-		printf '%s\n' "container_name=$container_name"
-		printf '%s\n' "uid=0"
-		printf '%s\n' "wd=$workspace"
+		log_debug "container_name=$inputs_container_name"
+		log_debug "custom_image_tag=$custom_image_tag"
+		log_debug "uid=0"
+		log_debug "wd=$workspace"
 	} >> "$GITHUB_OUTPUT"
 
 	# Exit gracefully
 	exit 0
 fi
 
-# Debug: Print all input variables
-log_debug "Input variables:"
-log_debug "  inputs_use_host_env='$inputs_use_host_env'"
-log_debug "  inputs_uid='$inputs_uid'"
-log_debug "  inputs_gid='$inputs_gid'"
-log_debug "  inputs_container_name='$inputs_container_name'"
-log_debug "  inputs_os_id='$inputs_os_id'"
-log_debug "  inputs_os_version_id='$inputs_os_version_id'"
-log_debug "  inputs_custom_docker_commands='$inputs_custom_docker_commands'"
-log_debug "  inputs_additional_alpine_apps='$inputs_additional_alpine_apps'"
-log_debug "  inputs_additional_debian_apps='$inputs_additional_debian_apps'"
-log_debug "  workspace='$workspace'"
-
-# Parse the custom docker commands string into an array
-read -ra inputs_custom_docker_commands_array <<< "$inputs_custom_docker_commands"
-
-# start creating our base docker command
-docker_command=("run" "--name" "$inputs_container_name" "-it" "-d")
+###
+### Fast-path: ends Here
+###
 
 # Detect root mode once and reuse
 if [[ $inputs_uid == "root" ]] || [[ $inputs_uid == "0" ]]; then
@@ -136,31 +161,6 @@ fi
 if [[ $inputs_use_host_env == 'true' ]]; then
 	env > "${workspace}/env.host"
 fi
-
-if [[ -f "${workspace}/env.host" && -f "${workspace}/env.custom" ]]; then
-	cat "${workspace}/env.host" "${workspace}/env.custom" > "${workspace}/env.load"
-	env_custom="host + custom"
-elif [[ -f "${workspace}/env.host" && ! -f "${workspace}/env.custom" ]]; then
-	cat "${workspace}/env.host" > "${workspace}/env.load"
-	env_custom="host only"
-elif [[ ! -f "${workspace}/env.host" && -f "${workspace}/env.custom" ]]; then
-	cat "${workspace}/env.custom" > "${workspace}/env.load"
-	env_custom="custom only"
-else
-	env_custom="none"
-fi
-
-# Only add env-file if merged file exists
-if [[ -f "${workspace}/env.load" ]]; then
-	docker_command+=("--env-file" "${workspace}/env.load")
-fi
-
-# Only add LANG if OS is debian/ubuntu (supports repo-qualified names like something/debian)
-case "$inputs_os_id" in
-	debian | */debian | ubuntu | */ubuntu)
-		docker_command+=("-e" "LANG=C.UTF-8")
-		;;
-esac
 
 # Add user specification based on image type
 if [[ $inputs_os_id == ghcr.io/userdocs/* ]]; then
@@ -339,25 +339,25 @@ done
 
 {
 	printf '%b\n' "\`\`\`bash\n"
-	printf '%s\n' "inputs_use_host_env=\"${inputs_use_host_env}\""
-	printf '%s\n' "env_custom=\"${env_custom:-none}\""
-	printf '%s\n' "inputs_uid=\"${inputs_uid}\""
-	printf '%s\n' "inputs_gid=\"${inputs_gid}\""
-	printf '%s\n' "inputs_container_name=\"${inputs_container_name}\""
-	printf '%s\n' "inputs_os_id=\"${inputs_os_id}\""
-	printf '%s\n' "inputs_os_version_id=\"${inputs_os_version_id}\""
-	printf '%s\n' "inputs_custom_docker_commands=\"${inputs_custom_docker_commands}\""
-	printf '%s\n' "inputs_additional_debian_apps=\"${inputs_additional_debian_apps}\""
-	printf '%s\n' "inputs_additional_alpine_apps=\"${inputs_additional_alpine_apps}\""
-	printf '%s\n' "workspace=\"${workspace}\""
-	printf '%s\n' "docker_command=\"${docker_command[*]}\""
-	printf '%s\n' "wd=\"${wd}\""
+	log_debug "inputs_use_host_env=\"${inputs_use_host_env}\""
+	log_debug "env_custom=\"${env_custom:-none}\""
+	log_debug "inputs_uid=\"${inputs_uid}\""
+	log_debug "inputs_gid=\"${inputs_gid}\""
+	log_debug "inputs_container_name=\"${inputs_container_name}\""
+	log_debug "inputs_os_id=\"${inputs_os_id}\""
+	log_debug "inputs_os_version_id=\"${inputs_os_version_id}\""
+	log_debug "inputs_custom_docker_commands=\"${inputs_custom_docker_commands}\""
+	log_debug "inputs_additional_debian_apps=\"${inputs_additional_debian_apps}\""
+	log_debug "inputs_additional_alpine_apps=\"${inputs_additional_alpine_apps}\""
+	log_debug "workspace=\"${workspace}\""
+	log_debug "docker_command=\"${docker_command[*]}\""
+	log_debug "wd=\"${wd}\""
 	printf '%b\n' '```'
 } >> "$GITHUB_STEP_SUMMARY"
 
 # Set outputs
 {
-	printf '%s\n' "container_name=$inputs_container_name"
-	printf '%s\n' "uid=$inputs_uid"
-	printf '%s\n' "wd=$wd"
+	log_debug "container_name=$inputs_container_name"
+	log_debug "uid=$inputs_uid"
+	log_debug "wd=$wd"
 } >> "$GITHUB_OUTPUT"
