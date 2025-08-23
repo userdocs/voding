@@ -24,17 +24,6 @@ log_debug() {
 	printf '[DEBUG] %s\n' "$1"
 }
 
-# Set the vars for log summaries.
-if [[ $inputs_use_root == "true" ]]; then
-	username="root"
-	username_uid="0"
-	username_gid="0"
-else
-	username="gh"
-	username_uid="1001"
-	username_gid="1001"
-fi
-
 _inputs_info() {
 	printf '%b\n' "\`\`\`bash\n"
 	log_debug "Input info:"
@@ -183,52 +172,36 @@ fi
 ### Fast-path: ends Here
 ###
 
-# Add user specification based on image type
-if [[ $inputs_os_id == ghcr.io/userdocs/* ]]; then
-	if [[ $inputs_use_root == "false" ]]; then
-		docker_command+=("-u" "1001:1001")
-	fi
-fi
-
 if [[ $inputs_use_root == "true" ]]; then
-	docker_command+=("-w" "/root")
+	username="root"
+	username_uid="0"
+	username_gid="0"
+	docker_command+=("-u" "0:0")
 else
-	docker_command+=("-w" "/home/gh")
+	username="gh"
+	username_uid="1001"
+	username_gid="1001"
+	docker_command+=("-u" "1001:1001")
 fi
 
-docker_command+=("-v" "$workspace:/root")
+wd="/home/gh" # use the same for root or github
+docker_command+=("-w" "$wd")
+docker_command+=("-v" "$workspace:$wd")
+docker_command+=("${inputs_custom_docker_commands_array[@]}")
 
-if [[ $inputs_os_id == ghcr.io/userdocs/* ]]; then
-	docker_command+=(
-		"-v" "$workspace:/home/gh"
-		"-v" "$workspace:/home/github"
-		"-v" "$workspace:/home/username"
-	)
-fi
-
-if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
-	docker_command+=(
-		"-v" "$workspace:/home/gh"
-	)
-fi
-
-docker_command+=(
-	"${inputs_custom_docker_commands_array[@]}"
-)
-
-# Determine user setup for non-userdocs images
+# ghcr.io/userdocs are preconfigured to have root + gh with passwordless sudo so we just need to pull them in
 if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 	# Create Dockerfile and build image with user setup
 	dockerfile_path="${workspace}/qbt_builder_dockerfile"
 	custom_image_tag="qbt_builder"
+
+	# Avoid heredoc (EOF) which can break in some CI environments (GitHub Actions).
 
 	case "$inputs_os_id" in
 		alpine | */alpine)
 			log_info "Creating Alpine Linux Dockerfile"
 			printf '%b\n' "\`\`\`bash\n" >> "$GITHUB_STEP_SUMMARY"
 			{
-				# Avoid heredoc (EOF) which can break in some CI environments (GitHub Actions).
-				# Build the Dockerfile lines in an array, use a single printf to print them.
 				backslash=$'\\'
 				df_lines=(
 					"FROM ${inputs_os_id}:${inputs_os_version_id}"
@@ -308,11 +281,6 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 	# Clean up the Dockerfile
 	rm -f "$dockerfile_path"
 
-	# Use the custom image and configure user for container run
-	if [[ $inputs_use_root == "false" ]]; then
-		docker_command+=("-u" "1001:1001")
-	fi
-
 	docker_command+=("$custom_image_tag")
 else
 	# For userdocs images, use original image
@@ -323,13 +291,6 @@ docker "${docker_command[@]}" || {
 	log_error "Failed to create Docker container with command: ${docker_command[*]}"
 	exit 1
 }
-
-for i in "${!docker_command[@]}"; do
-	if [[ ${docker_command[i]} == "-w" ]]; then
-		wd="${docker_command[i + 1]}"
-		break
-	fi
-done
 
 _inputs_info | tee -a "$GITHUB_STEP_SUMMARY"
 _env_info
