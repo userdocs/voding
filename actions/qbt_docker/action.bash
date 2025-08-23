@@ -26,6 +26,87 @@ log_debug() {
 	printf '[DEBUG] %s\n' "$1"
 }
 
+# Fast-path: if the user supplied a Dockerfile, ignore other inputs and only
+# fetch/validate/build that Dockerfile and emit minimal outputs. Placing this
+# check here (immediately after function defs) ensures no other processing
+# occurs (including debug prints, env merging, docker_command construction)
+# when a Dockerfile is provided.
+if [[ -n $inputs_dockerfile ]]; then
+	dockerfile_path="${workspace}/Dockerfile.custom"
+	log_info "Fast-path: using provided Dockerfile: $inputs_dockerfile"
+
+	case "$inputs_dockerfile" in
+		http://* | https://*)
+			log_info "Downloading Dockerfile from URL: $inputs_dockerfile"
+			curl -fsSL "$inputs_dockerfile" -o "$dockerfile_path" || {
+				log_error "Failed to download Dockerfile from $inputs_dockerfile"
+				exit 1
+			}
+			;;
+		*)
+			if [[ -f $inputs_dockerfile ]]; then
+				cp "$inputs_dockerfile" "$dockerfile_path" || {
+					log_error "Failed to copy Dockerfile from $inputs_dockerfile to $dockerfile_path"
+					exit 1
+				}
+			elif [[ -f "$workspace/$inputs_dockerfile" ]]; then
+				cp "$workspace/$inputs_dockerfile" "$dockerfile_path" || {
+					log_error "Failed to copy Dockerfile from $workspace/$inputs_dockerfile to $dockerfile_path"
+					exit 1
+				}
+			else
+				log_error "Dockerfile not found at '$inputs_dockerfile' or '$workspace/$inputs_dockerfile'"
+				exit 1
+			fi
+			;;
+	esac
+
+	if [[ ! -s $dockerfile_path ]]; then
+		log_error "Dockerfile is empty or missing after fetch: $dockerfile_path"
+		exit 1
+	fi
+
+	# Write Dockerfile to the step summary for visibility
+	log_info "Using Dockerfile: $dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
+	{
+		printf '%b\n' "\`\`\`bash\n"
+		cat "$dockerfile_path"
+		printf '%b\n' '```'
+	} >> "$GITHUB_STEP_SUMMARY"
+
+	# Build with a simple predictable tag
+	custom_image_tag="builder"
+	container_name="builder"
+
+	log_info "Building image from provided Dockerfile as: $custom_image_tag"
+	docker build -f "$dockerfile_path" -t "$custom_image_tag" . || {
+		log_error "Failed to build Docker image from provided Dockerfile"
+		# Clean up Dockerfile if left behind
+		rm -f "$dockerfile_path"
+		exit 1
+	}
+
+	# Start a container (detached) from the built image so it's running like a daemon.
+	log_info "Starting container from image '$custom_image_tag' as '$container_name' (detached)"
+	docker run -d --name "$container_name" "$custom_image_tag" || {
+		log_error "Failed to start container from image $custom_image_tag"
+		rm -f "$dockerfile_path"
+		exit 1
+	}
+
+	# Clean up the temporary Dockerfile and emit minimal outputs
+	rm -f "$dockerfile_path"
+
+	{
+		printf '%s\n' "container_name=$container_name"
+		printf '%s\n' "uid=0"
+		printf '%s\n' "wd=$workspace"
+	} >> "$GITHUB_OUTPUT"
+
+	# Exit gracefully
+	exit 0
+fi
+
 # Debug: Print all input variables
 log_debug "Input variables:"
 log_debug "  inputs_use_host_env='$inputs_use_host_env'"
