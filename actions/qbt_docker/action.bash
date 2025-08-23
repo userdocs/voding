@@ -27,26 +27,27 @@ log_debug() {
 _inputs_info() {
 	printf '%b\n' "\`\`\`bash\n"
 	log_debug "Input info:"
+	log_debug ""
 	log_debug "inputs_dockerfile=\"${inputs_dockerfile}\""
 	log_debug "inputs_use_host_env=\"${inputs_use_host_env}\""
-	log_debug "env_custom=\"${env_custom:-none}\""
 	log_debug "inputs_use_root=\"${inputs_use_root}\""
-	log_debug 'container_name="qbt_builder"'
 	log_debug "inputs_os_id=\"${inputs_os_id}\""
 	log_debug "inputs_os_version_id=\"${inputs_os_version_id}\""
 	log_debug "inputs_custom_docker_commands=\"${inputs_custom_docker_commands}\""
 	log_debug "inputs_additional_debian_apps=\"${inputs_additional_debian_apps}\""
 	log_debug "inputs_additional_alpine_apps=\"${inputs_additional_alpine_apps}\""
+	log_debug ""
+	log_debug "other info:"
+	log_debug ""
+	log_debug "env_custom=\"${env_custom:-none}\""
+	log_debug 'container_name="qbt_builder"'
 	log_debug "workspace=\"${workspace}\""
 	log_debug "docker_command=\"${docker_command[*]}\""
 	log_debug "wd=\"${wd}\""
-
+	log_debug ""
 	log_debug "env/output info: These are set to github env/outputs and cannot be changed or manipulated by inputs"
-
+	log_debug ""
 	log_debug "container_name=qbt_builder"
-	log_debug "username=$username"
-	log_debug "username_uid=$username_uid"
-	log_debug "username_gid=$username_gid"
 	log_debug "wd=$wd"
 	printf '%b\n' '```'
 }
