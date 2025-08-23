@@ -172,19 +172,22 @@ fi
 ### Fast-path: ends Here
 ###
 
+wd="/home/gh" # use the same working directory for root or github
+non_root_user="gh"
+non_root_uid="1001"
+non_root_gid="1001"
+
 if [[ $inputs_use_root == "true" ]]; then
-	username="root"
-	username_uid="0"
-	username_gid="0"
-	docker_command+=("-u" "0:0")
+	username="root"  # logging only
+	username_uid="0" # logging only
+	username_gid="0" # logging only
 else
-	username="gh"
-	username_uid="1001"
-	username_gid="1001"
-	docker_command+=("-u" "1001:1001")
+	username="${non_root_user}"    # logging only
+	username_uid="${non_root_uid}" # logging only
+	username_gid="${non_root_gid}" # logging only
+	docker_command+=("-u" "${non_root_uid}:${non_root_gid}")
 fi
 
-wd="/home/gh" # use the same for root or github
 docker_command+=("-w" "$wd")
 docker_command+=("-v" "$workspace:$wd")
 docker_command+=("${inputs_custom_docker_commands_array[@]}")
@@ -196,7 +199,6 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 	custom_image_tag="qbt_builder"
 
 	# Avoid heredoc (EOF) which can break in some CI environments (GitHub Actions).
-
 	case "$inputs_os_id" in
 		alpine | */alpine)
 			log_info "Creating Alpine Linux Dockerfile"
@@ -208,10 +210,10 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 					""
 					"# Install packages, create group/user and configure sudo"
 					"RUN apk add --no-cache sudo bash ${inputs_additional_alpine_apps} && ${backslash}"
-					"    addgroup -g 1001 gh && ${backslash}"
-					"    adduser -h /home/gh -D -s /bin/bash -u 1001 -G gh gh && ${backslash}"
-					"    umask 077 && printf '%s\\n' \"gh ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/gh && ${backslash}"
-					"    chmod 0440 /etc/sudoers.d/gh"
+					"    addgroup -g ${non_root_gid} ${non_root_user} && ${backslash}"
+					"    adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} -G ${non_root_user} ${non_root_user} && ${backslash}"
+					"    umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && ${backslash}"
+					"    chmod 0440 /etc/sudoers.d/${non_root_user}"
 				)
 				printf '%s\n' "${df_lines[@]}"
 			} | tee "$dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -233,10 +235,10 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 					"# Update packages, install dependencies, create user/group and configure sudo"
 					"RUN apt-get update && apt-get upgrade -y && ${backslash}"
 					"    apt-get install -y sudo ${inputs_additional_debian_apps} && ${backslash}"
-					"    groupadd -g 1001 gh && ${backslash}"
-					"    useradd -ms /bin/bash -u 1001 -g 1001 gh && ${backslash}"
-					"    umask 077 && printf '%s\\n' \"gh ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/gh && ${backslash}"
-					"    chmod 0440 /etc/sudoers.d/gh"
+					"    groupadd -g ${non_root_gid} ${non_root_user} && ${backslash}"
+					"    useradd -ms /bin/bash -u ${non_root_uid} -g ${non_root_gid} ${non_root_user} && ${backslash}"
+					"    umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && ${backslash}"
+					"    chmod 0440 /etc/sudoers.d/${non_root_user}"
 				)
 				printf '%s\n' "${df_lines[@]}"
 			} | tee "$dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -261,9 +263,9 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 					"  elif command -v apk >/dev/null 2>&1; then ${backslash}"
 					"    apk add --no-cache sudo ${inputs_additional_alpine_apps} >/dev/null 2>&1; ${backslash}"
 					"  fi && ${backslash}"
-					"    groupadd -g 1001 gh 2>/dev/null || addgroup 1001 2>/dev/null || true && ${backslash}"
-					"    useradd -ms /bin/bash -u 1001 gh 2>/dev/null || adduser -h /home/gh -D -s /bin/bash -u 1001 gh 2>/dev/null || true && ${backslash}"
-					"    if command -v sudo >/dev/null 2>&1; then umask 077 && printf '%s\\n' \"gh ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/gh && chmod 0440 /etc/sudoers.d/gh; fi"
+					"    groupadd -g ${non_root_gid} ${non_root_user} 2>/dev/null || addgroup ${non_root_gid} 2>/dev/null || true && ${backslash}"
+					"    useradd -ms /bin/bash -u ${non_root_uid} ${non_root_user} 2>/dev/null || adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} ${non_root_user} 2>/dev/null || true && ${backslash}"
+					"    if command -v sudo >/dev/null 2>&1; then umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && chmod 0440 /etc/sudoers.d/${non_root_user}; fi"
 				)
 				printf '%s\n' "${df_lines[@]}"
 			} | tee "$dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
