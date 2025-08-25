@@ -167,7 +167,7 @@ if [[ -n $inputs_dockerfile ]]; then
 
 	# Start a container (detached) from the built image so it's running like a daemon.
 	log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
-	docker "${inputs_custom_docker_commands_array[@]}" "${docker_command[@]}" || {
+	docker "${inputs_additional_alpine_apps}" "${docker_command[@]}" || {
 		log_error "Failed to start container from image $custom_image_tag"
 		rm -f "$dockerfile_path"
 		exit 1
@@ -307,7 +307,7 @@ else
 	docker_command+=("${inputs_os_id}:${inputs_os_version_id}")
 fi
 
-docker "${inputs_custom_docker_commands_array[@]}" "${docker_command[@]}" || {
+docker "${inputs_additional_alpine_apps}" "${docker_command[@]}" || {
 	log_error "Failed to create Docker container with command: ${docker_command[*]}"
 	exit 1
 }
