@@ -167,7 +167,7 @@ if [[ -n $inputs_dockerfile ]]; then
 
 	# Start a container (detached) from the built image so it's running like a daemon.
 	log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
-	docker "${docker_command[@]}" || {
+	docker "${docker_command[@]}" "${inputs_custom_docker_commands_array[@]}" || {
 		log_error "Failed to start container from image $custom_image_tag"
 		rm -f "$dockerfile_path"
 		exit 1
@@ -208,7 +208,7 @@ fi
 
 docker_command+=("-w" "$wd")
 docker_command+=("-v" "$workspace:$wd")
-docker_command+=("${inputs_custom_docker_commands_array[@]}")
+# docker_command+=("${inputs_custom_docker_commands_array[@]}")
 
 # ghcr.io/userdocs are preconfigured to have root + gh with passwordless sudo so we just need to pull them in
 if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
@@ -307,7 +307,7 @@ else
 	docker_command+=("${inputs_os_id}:${inputs_os_version_id}")
 fi
 
-docker "${docker_command[@]}" || {
+docker "${docker_command[@]}" "${inputs_custom_docker_commands_array[@]}" || {
 	log_error "Failed to create Docker container with command: ${docker_command[*]}"
 	exit 1
 }
