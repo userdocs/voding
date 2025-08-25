@@ -18,13 +18,6 @@ readonly non_root_user="gh"
 readonly non_root_uid="1001"
 readonly non_root_gid="1001"
 
-# These variables are immutable and cannot be changed by injection or used to run subshell commands.
-readonly container_name="qbt_builder"
-readonly wd="/home/gh"
-readonly non_root_user="gh"
-readonly non_root_uid="1001"
-readonly non_root_gid="1001"
-
 # Functions for consistent logging
 log_info() {
 	printf '[INFO] %s\n' "$1"
