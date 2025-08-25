@@ -194,12 +194,7 @@ fi
 # Note: The yml coming through from the action with is new line separated not space separated
 
 # Parse the custom docker commands string into an array
-# Remove CRs, then escape literal double-quotes so entries like --env "VAR=val" are preserved
-tmp_inputs_custom_docker_commands="$(printf '%s' "$inputs_custom_docker_commands" | tr -d '\r')"
-# Escape double quotes by replacing " with \"
-inputs_custom_docker_commands_escaped="${tmp_inputs_custom_docker_commands//\"/\\\"}"
-IFS=$'\n' read -r -a inputs_custom_docker_commands_array <<< "${inputs_custom_docker_commands_escaped}"
-log_debug "Escaped custom docker commands: ${inputs_custom_docker_commands_array[*]}"
+IFS=$'\n' read -r -a inputs_custom_docker_commands_array <<< "$(printf '%s' "${inputs_custom_docker_commands@Q}" | tr -d '\r')"
 
 # Parse the additional docker apps string into an array
 IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
