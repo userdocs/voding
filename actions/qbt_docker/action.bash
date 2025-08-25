@@ -11,6 +11,13 @@ inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
 inputs_dockerfile="${inputs_dockerfile:-}"
 workspace="${GITHUB_WORKSPACE:-$PWD}"
 
+# These variables are immutable and cannot be changed by injection or used to run subshell commands.
+readonly container_name="qbt_builder"
+readonly wd="/home/gh"
+readonly non_root_user="gh"
+readonly non_root_uid="1001"
+readonly non_root_gid="1001"
+
 # Functions for consistent logging
 log_info() {
 	printf '[INFO] %s\n' "$1"
@@ -33,21 +40,21 @@ _inputs_info() {
 	log_debug "inputs_use_root=\"${inputs_use_root}\""
 	log_debug "inputs_os_id=\"${inputs_os_id}\""
 	log_debug "inputs_os_version_id=\"${inputs_os_version_id}\""
-	log_debug "inputs_custom_docker_commands=\"${inputs_custom_docker_commands}\""
-	log_debug "inputs_additional_debian_apps=\"${inputs_additional_debian_apps}\""
-	log_debug "inputs_additional_alpine_apps=\"${inputs_additional_alpine_apps}\""
+	log_debug "inputs_custom_docker_commands=\"${inputs_custom_docker_commands_array[*]}\""
+	log_debug "inputs_additional_alpine_apps=\"${inputs_additional_alpine_apps_array[*]}\""
+	log_debug "inputs_additional_debian_apps=\"${inputs_additional_debian_apps_array[*]}\""
 	log_debug ""
 	log_debug "other info:"
 	log_debug ""
 	log_debug "env_custom=\"${env_custom:-none}\""
-	log_debug 'container_name="qbt_builder"'
+	log_debug "container_name=${container_name}"
 	log_debug "workspace=\"${workspace}\""
 	log_debug "docker_command=\"${docker_command[*]}\""
 	log_debug "wd=\"${wd}\""
 	log_debug ""
 	log_debug "env/output info: These are set to github env/outputs and cannot be changed or manipulated by inputs"
 	log_debug ""
-	log_debug "container_name=qbt_builder"
+	log_debug "container_name=${container_name}"
 	log_debug "wd=$wd"
 	printf '%b\n' '```'
 }
@@ -55,15 +62,26 @@ _inputs_info() {
 # These are set to github env/outputs and cannot be changed or manipulated by inputs"
 
 _env_info() {
-	printf '%s\n' "container_name=qbt_builder" >> "$GITHUB_ENV"
+	printf '%s\n' "container_name=${container_name}" >> "$GITHUB_ENV"
 	printf '%s\n' "wd=$wd" >> "$GITHUB_ENV"
 }
 
-# start creating our base docker command
-docker_command=("run" "-it" "-d" "--name" "qbt_builder")
+to_gh_env() {
+	printf '%s\n' "${1}" | tee -a "$GITHUB_ENV"
+}
 
-# Parse the custom docker commands string into an array
-read -ra inputs_custom_docker_commands_array <<< "$inputs_custom_docker_commands"
+to_gh_output() {
+	printf '%s\n' "${1}" | tee -a "$GITHUB_OUTPUT"
+}
+
+log_summary() {
+	printf '%b\n' '```bash' | tee -a "$GITHUB_STEP_SUMMARY"
+	printf '%b\n' "${1}" | tee -a "$GITHUB_STEP_SUMMARY"
+	printf '%b\n' '```' | tee -a "$GITHUB_STEP_SUMMARY"
+}
+
+# start creating our base docker command
+docker_command=("run" "-it" "-d" "--name" "${container_name}")
 
 if [[ $inputs_use_host_env == 'true' ]]; then
 	env > "${workspace}/env.host"
@@ -92,7 +110,7 @@ fi
 ###
 
 if [[ -n $inputs_dockerfile ]]; then
-	dockerfile_path="${workspace}/qbt_builder_dockerfile"
+	dockerfile_path="${workspace}/${container_name}_dockerfile"
 	log_info "Fast-path: using provided Dockerfile: $inputs_dockerfile"
 
 	case "$inputs_dockerfile" in
@@ -148,7 +166,7 @@ if [[ -n $inputs_dockerfile ]]; then
 	docker_command+=("$custom_image_tag")
 
 	# Start a container (detached) from the built image so it's running like a daemon.
-	log_info "Starting container from image '$custom_image_tag' as 'qbt_builder' (detached)"
+	log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
 	docker "${docker_command[@]}" || {
 		log_error "Failed to start container from image $custom_image_tag"
 		rm -f "$dockerfile_path"
@@ -173,19 +191,16 @@ fi
 ### Fast-path: ends Here
 ###
 
-wd="/home/gh" # use the same working directory for root or github
-non_root_user="gh"
-non_root_uid="1001"
-non_root_gid="1001"
+# Note: The yml coming through from the action with is new line separated not space separated
 
-if [[ $inputs_use_root == "true" ]]; then
-	username="root"  # logging only
-	username_uid="0" # logging only
-	username_gid="0" # logging only
-else
-	username="${non_root_user}"    # logging only
-	username_uid="${non_root_uid}" # logging only
-	username_gid="${non_root_gid}" # logging only
+# Parse the custom docker commands string into an array
+IFS=$'\n' read -r -a inputs_custom_docker_commands_array <<< "$(printf '%s' "$inputs_custom_docker_commands" | tr -d '\r')"
+
+# Parse the additional docker apps string into an array
+IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
+IFS=$'\n' read -r -a inputs_additional_debian_apps_array <<< "$(printf '%s' "$inputs_additional_debian_apps" | tr -d '\r')"
+
+if [[ $inputs_use_root == "false" ]]; then
 	docker_command+=("-u" "${non_root_uid}:${non_root_gid}")
 fi
 
@@ -196,8 +211,8 @@ docker_command+=("${inputs_custom_docker_commands_array[@]}")
 # ghcr.io/userdocs are preconfigured to have root + gh with passwordless sudo so we just need to pull them in
 if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 	# Create Dockerfile and build image with user setup
-	dockerfile_path="${workspace}/qbt_builder_dockerfile"
-	custom_image_tag="qbt_builder"
+	dockerfile_path="${workspace}/${container_name}_dockerfile"
+	custom_image_tag="${container_name}"
 
 	# Avoid heredoc (EOF) which can break in some CI environments (GitHub Actions).
 	case "$inputs_os_id" in
@@ -210,7 +225,7 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 					"FROM ${inputs_os_id}:${inputs_os_version_id}"
 					""
 					"# Install packages, create group/user and configure sudo"
-					"RUN apk add --no-cache sudo bash ${inputs_additional_alpine_apps} && ${backslash}"
+					"RUN apk add --no-cache sudo bash ${inputs_additional_alpine_apps_array[@]} && ${backslash}"
 					"    addgroup -g ${non_root_gid} ${non_root_user} && ${backslash}"
 					"    adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} -G ${non_root_user} ${non_root_user} && ${backslash}"
 					"    umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && ${backslash}"
@@ -235,7 +250,7 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 					""
 					"# Update packages, install dependencies, create user/group and configure sudo"
 					"RUN apt-get update && apt-get upgrade -y && ${backslash}"
-					"    apt-get install -y sudo ${inputs_additional_debian_apps} && ${backslash}"
+					"    apt-get install -y sudo ${inputs_additional_debian_apps_array[@]} && ${backslash}"
 					"    groupadd -g ${non_root_gid} ${non_root_user} && ${backslash}"
 					"    useradd -ms /bin/bash -u ${non_root_uid} -g ${non_root_gid} ${non_root_user} && ${backslash}"
 					"    umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && ${backslash}"
@@ -260,9 +275,9 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 					""
 					"# Try to install sudo, create group/user (basic fallback) and configure sudo if present"
 					"RUN if command -v apt-get >/dev/null 2>&1; then ${backslash}"
-					"    apt-get update >/dev/null 2>&1 && apt-get install -y sudo ${inputs_additional_debian_apps} >/dev/null 2>&1; ${backslash}"
+					"    apt-get update >/dev/null 2>&1 && apt-get install -y sudo ${inputs_additional_debian_apps_array[@]} >/dev/null 2>&1; ${backslash}"
 					"  elif command -v apk >/dev/null 2>&1; then ${backslash}"
-					"    apk add --no-cache sudo ${inputs_additional_alpine_apps} >/dev/null 2>&1; ${backslash}"
+					"    apk add --no-cache sudo ${inputs_additional_alpine_apps_array[@]} >/dev/null 2>&1; ${backslash}"
 					"  fi && ${backslash}"
 					"    groupadd -g ${non_root_gid} ${non_root_user} 2>/dev/null || addgroup ${non_root_gid} 2>/dev/null || true && ${backslash}"
 					"    useradd -ms /bin/bash -u ${non_root_uid} ${non_root_user} 2>/dev/null || adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} ${non_root_user} 2>/dev/null || true && ${backslash}"
