@@ -1,15 +1,15 @@
 #!/bin/bash
 
-# Config (env-overridable)
-inputs_use_host_env="${inputs_use_host_env:-false}"
-inputs_use_root="${inputs_use_root:-false}"
-inputs_os_id="${inputs_os_id:=alpine}"
-inputs_os_version_id="${inputs_os_version_id:=edge}"
-inputs_custom_docker_commands="${inputs_custom_docker_commands:-}"
-inputs_additional_alpine_apps="${inputs_additional_alpine_apps:-}"
-inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
-inputs_dockerfile="${inputs_dockerfile:-}"
-workspace="${GITHUB_WORKSPACE:-$PWD}"
+# # Config (env-overridable)
+# inputs_use_host_env="${inputs_use_host_env:-false}"
+# inputs_use_root="${inputs_use_root:-false}"
+# inputs_os_id="${inputs_os_id:=alpine}"
+# inputs_os_version_id="${inputs_os_version_id:=edge}"
+# inputs_custom_docker_commands="${inputs_custom_docker_commands:-}"
+# inputs_additional_alpine_apps="${inputs_additional_alpine_apps:-}"
+# inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
+# inputs_dockerfile="${inputs_dockerfile:-}"
+# workspace="${GITHUB_WORKSPACE:-$PWD}"
 
 # These variables are immutable and cannot be changed by injection or used to run subshell commands.
 readonly container_name="qbt_builder"
@@ -194,11 +194,18 @@ fi
 # Note: The yml coming through from the action with is new line separated not space separated
 
 # Parse the custom docker commands string into an array
-IFS=$'\n' read -r -a inputs_custom_docker_commands_array <<< "$(printf '%s' "$inputs_custom_docker_commands" | tr -d '\r')"
+# Remove CRs, then escape literal double-quotes so entries like --env "VAR=val" are preserved
+tmp_inputs_custom_docker_commands="$(printf '%s' "$inputs_custom_docker_commands" | tr -d '\r')"
+# Escape double quotes by replacing " with \"
+inputs_custom_docker_commands_escaped="${tmp_inputs_custom_docker_commands//\"/\\\"}"
+IFS=$'\n' read -r -a inputs_custom_docker_commands_array <<< "${inputs_custom_docker_commands_escaped}"
+log_debug "Escaped custom docker commands: ${inputs_custom_docker_commands_array[*]}"
 
 # Parse the additional docker apps string into an array
 IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
 IFS=$'\n' read -r -a inputs_additional_debian_apps_array <<< "$(printf '%s' "$inputs_additional_debian_apps" | tr -d '\r')"
+
+log_debug "${inputs_custom_docker_commands_array[@]}"
 
 if [[ $inputs_use_root == "false" ]]; then
 	docker_command+=("-u" "${non_root_uid}:${non_root_gid}")
