@@ -167,7 +167,7 @@ if [[ -n $inputs_dockerfile ]]; then
 
 	# Start a container (detached) from the built image so it's running like a daemon.
 	log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
-	docker "${inputs_additional_alpine_apps}" "${docker_command[@]}" || {
+	docker "${docker_command[@]}" || {
 		log_error "Failed to start container from image $custom_image_tag"
 		rm -f "$dockerfile_path"
 		exit 1
@@ -194,13 +194,11 @@ fi
 # Note: The yml coming through from the action with is new line separated not space separated
 
 # Parse the custom docker commands string into an array
-read -r -a inputs_custom_docker_commands_array <<< "$(printf '%s' "${inputs_custom_docker_commands}" | tr -d '\r')"
+IFS=$'\n' read -r -a inputs_custom_docker_commands_array <<< "$(printf '%s' "$inputs_custom_docker_commands" | tr -d '\r')"
+
 # Parse the additional docker apps string into an array
 IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
 IFS=$'\n' read -r -a inputs_additional_debian_apps_array <<< "$(printf '%s' "$inputs_additional_debian_apps" | tr -d '\r')"
-
-log_debug "123: $(printf '%s' "${inputs_custom_docker_commands}" | tr -d '\r')"
-log_debug "234: ${inputs_custom_docker_commands_array[*]}"
 
 if [[ $inputs_use_root == "false" ]]; then
 	docker_command+=("-u" "${non_root_uid}:${non_root_gid}")
@@ -208,7 +206,7 @@ fi
 
 docker_command+=("-w" "$wd")
 docker_command+=("-v" "$workspace:$wd")
-# docker_command+=("${inputs_custom_docker_commands_array[@]}")
+docker_command+=("${inputs_custom_docker_commands_array[@]}")
 
 # ghcr.io/userdocs are preconfigured to have root + gh with passwordless sudo so we just need to pull them in
 if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
@@ -307,7 +305,7 @@ else
 	docker_command+=("${inputs_os_id}:${inputs_os_version_id}")
 fi
 
-docker "${inputs_additional_alpine_apps}" "${docker_command[@]}" || {
+docker "${docker_command[@]}" || {
 	log_error "Failed to create Docker container with command: ${docker_command[*]}"
 	exit 1
 }
