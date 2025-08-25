@@ -40,7 +40,7 @@ _inputs_info() {
 	log_debug "inputs_use_root=\"${inputs_use_root}\""
 	log_debug "inputs_os_id=\"${inputs_os_id}\""
 	log_debug "inputs_os_version_id=\"${inputs_os_version_id}\""
-	log_debug "inputs_custom_docker_commands=\"${inputs_custom_docker_commands_array[*]}\""
+	log_debug "inputs_custom_docker_commands=\"${clean_envs[*]}\""
 	log_debug "inputs_additional_alpine_apps=\"${inputs_additional_alpine_apps_array[*]}\""
 	log_debug "inputs_additional_debian_apps=\"${inputs_additional_debian_apps_array[*]}\""
 	log_debug ""
@@ -80,9 +80,6 @@ log_summary() {
 	printf '%b\n' '```' | tee -a "$GITHUB_STEP_SUMMARY"
 }
 
-# start creating our base docker command
-docker_command=("run" "-it" "-d" "--name" "${container_name}")
-
 if [[ $inputs_use_host_env == 'true' ]]; then
 	env > "${workspace}/env.host"
 fi
@@ -104,6 +101,68 @@ fi
 if [[ -f "${workspace}/env.load" ]]; then
 	docker_command+=("--env-file" "${workspace}/env.load")
 fi
+
+# Note: The yml coming through from the action with is new line separated not space separated
+
+# Parse the additional docker apps string into an array
+IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
+IFS=$'\n' read -r -a inputs_additional_debian_apps_array <<< "$(printf '%s' "$inputs_additional_debian_apps" | tr -d '\r')"
+
+# $INPUT_SETTING contains newline-separated items
+# Read lines (preserve empty lines for filtering) and strip CRs
+mapfile -t inputs_custom_docker_commands_array <<< "$(printf '%s' "$inputs_custom_docker_commands" | tr -d '\r')"
+
+# Build a token array suitable for passing to docker run.
+# Handle lines like: -e LDFLAGS=...  -> should become two tokens: -e and LDFLAGS=...
+# Also preserve quoted values and split on whitespace otherwise.
+clean_envs=()
+for e in "${inputs_custom_docker_commands_array[@]}"; do
+	# Skip empty or whitespace-only lines
+	if [[ -z ${e//[[:space:]]/} ]]; then
+		continue
+	fi
+
+	# Trim leading/trailing whitespace
+	e_trim=$(printf '%s' "$e" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+	# If entry starts with -e followed by space, split into two args: -e and the rest
+	# If entry starts with a single-letter short flag followed by space (e.g. -v /host:/container or -u 1001:1001),
+	# split into two args: '-v' and the rest. Do NOT split combined flags like -it.
+	if [[ $e_trim =~ ^-([A-Za-z0-9])[[:space:]]+(.+) ]]; then
+		clean_envs+=("-${BASH_REMATCH[1]}")
+		# expand whitelisted variables in the value part before appending
+		_val="${BASH_REMATCH[2]}"
+		# Expand wd in all possible forms, including inside quotes and arrays
+		_val="${_val//\$\{wd\}/$wd}"
+		_val="${_val//\$wd/$wd}"
+		clean_envs+=("$_val")
+		continue
+	fi
+
+	# If entry starts with a long option followed by space (e.g. --env VAR=... or --volume /host:/container),
+	# split into two args: '--env' and the rest. Leave equals-form (--env=VAL) untouched.
+	if [[ $e_trim =~ ^(--[^[:space:]=]+)[[:space:]]+(.+) ]]; then
+		clean_envs+=("${BASH_REMATCH[1]}")
+		# expand whitelisted variables in the value part before appending
+		_val="${BASH_REMATCH[2]}"
+		# Expand wd in all possible forms, including inside quotes and arrays
+		_val="${_val//\$\{wd\}/$wd}"
+		_val="${_val//\$wd/$wd}"
+		clean_envs+=("$_val")
+		continue
+	fi
+
+	# Otherwise split the trimmed line into words honoring shell quoting
+	# read -r -a will split on IFS (spaces) and preserve quoted groups
+	read -r -a tokens <<< "$e_trim"
+	for t in "${tokens[@]}"; do
+		# expand whitelisted variables in each token before appending
+		_t="$t"
+		_t="${_t//\$\{wd\}/$wd}"
+		_t="${_t//\$wd/$wd}"
+		clean_envs+=("$_t")
+	done
+done
 
 ###
 ### Fast-path: if the user supplied a Dockerfile, ignore other inputs except env related
@@ -167,7 +226,7 @@ if [[ -n $inputs_dockerfile ]]; then
 
 	# Start a container (detached) from the built image so it's running like a daemon.
 	log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
-	docker "${docker_command[@]}" || {
+	docker run -it -d --name "${container_name}" "${clean_envs[@]}" "${docker_command[@]}" || {
 		log_error "Failed to start container from image $custom_image_tag"
 		rm -f "$dockerfile_path"
 		exit 1
@@ -191,22 +250,12 @@ fi
 ### Fast-path: ends Here
 ###
 
-# Note: The yml coming through from the action with is new line separated not space separated
-
-# Parse the custom docker commands string into an array
-IFS=$'\n' read -r -a inputs_custom_docker_commands_array <<< "$(printf '%s' "$inputs_custom_docker_commands" | tr -d '\r')"
-
-# Parse the additional docker apps string into an array
-IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
-IFS=$'\n' read -r -a inputs_additional_debian_apps_array <<< "$(printf '%s' "$inputs_additional_debian_apps" | tr -d '\r')"
-
 if [[ $inputs_use_root == "false" ]]; then
 	docker_command+=("-u" "${non_root_uid}:${non_root_gid}")
 fi
 
 docker_command+=("-w" "$wd")
 docker_command+=("-v" "$workspace:$wd")
-docker_command+=("${inputs_custom_docker_commands_array[@]}")
 
 # ghcr.io/userdocs are preconfigured to have root + gh with passwordless sudo so we just need to pull them in
 if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
@@ -305,7 +354,7 @@ else
 	docker_command+=("${inputs_os_id}:${inputs_os_version_id}")
 fi
 
-docker "${docker_command[@]}" || {
+docker run -it -d --name "${container_name}" "${clean_envs[@]}" "${docker_command[@]}" || {
 	log_error "Failed to create Docker container with command: ${docker_command[*]}"
 	exit 1
 }
