@@ -167,7 +167,7 @@ if [[ -n $inputs_dockerfile ]]; then
 
 	# Start a container (detached) from the built image so it's running like a daemon.
 	log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
-	docker "${docker_command[@]}" "${inputs_custom_docker_commands_array[@]}" || {
+	docker "${inputs_custom_docker_commands_array[@]}" "${docker_command[@]}" || {
 		log_error "Failed to start container from image $custom_image_tag"
 		rm -f "$dockerfile_path"
 		exit 1
@@ -195,7 +195,6 @@ fi
 
 # Parse the custom docker commands string into an array
 IFS=$'\n' read -r -a inputs_custom_docker_commands_array <<< "$(printf '%s' "${inputs_custom_docker_commands}" | tr -d '\r')"
-
 # Parse the additional docker apps string into an array
 IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
 IFS=$'\n' read -r -a inputs_additional_debian_apps_array <<< "$(printf '%s' "$inputs_additional_debian_apps" | tr -d '\r')"
@@ -307,7 +306,7 @@ else
 	docker_command+=("${inputs_os_id}:${inputs_os_version_id}")
 fi
 
-docker "${docker_command[@]}" "${inputs_custom_docker_commands_array[@]}" || {
+docker "${inputs_custom_docker_commands_array[@]}" "${docker_command[@]}" || {
 	log_error "Failed to create Docker container with command: ${docker_command[*]}"
 	exit 1
 }
