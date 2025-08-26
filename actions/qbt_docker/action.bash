@@ -11,7 +11,16 @@ inputs_custom_docker_commands="${inputs_custom_docker_commands:-}"
 inputs_additional_alpine_apps="${inputs_additional_alpine_apps:-}"
 inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
 inputs_dockerfile="${inputs_dockerfile:-}"
-inputs_platform="${inputs_platform:-linux/amd64}"
+# Set default platform based on runner architecture
+case "${RUNNER_ARCH:-}" in
+	"X86") default_platform="linux/i386" ;;
+	"X64") default_platform="linux/amd64" ;;
+	"ARM") default_platform="linux/arm/v7" ;;
+	"ARM64") default_platform="linux/arm64" ;;
+	*) default_platform="linux/amd64" ;; # fallback to amd64
+esac
+
+inputs_platform="${inputs_platform:-$default_platform}"
 
 # These variables are immutable and cannot be changed by injection or used to run subshell commands.
 readonly container_name="qbt_builder"
