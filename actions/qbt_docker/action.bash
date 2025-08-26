@@ -255,8 +255,37 @@ fi
 # Note: The yml coming through from the action with is new line separated not space separated
 
 # Parse and validate additional docker apps
-IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
-IFS=$'\n' read -r -a inputs_additional_debian_apps_array <<< "$(printf '%s' "$inputs_additional_debian_apps" | tr -d '\r')"
+# Handle both YAML multiline (>) folded strings (space-separated) and literal (|) strings (newline-separated)
+parse_app_list() {
+	local input="$1"
+	local -n result_array=$2
+	
+	# Clear the result array
+	result_array=()
+	
+	if [[ -z "$input" ]]; then
+		return
+	fi
+	
+	# Remove carriage returns and convert newlines to spaces
+	local normalized_input
+	normalized_input=$(printf '%s' "$input" | tr -d '\r' | tr '\n' ' ')
+	
+	# Split on whitespace to handle different YAML formats
+	local temp_array
+	read -r -a temp_array <<< "$normalized_input"
+	
+	# Filter out empty elements
+	local item
+	for item in "${temp_array[@]}"; do
+		if [[ -n "$item" ]]; then
+			result_array+=("$item")
+		fi
+	done
+}
+
+parse_app_list "$inputs_additional_alpine_apps" inputs_additional_alpine_apps_array
+parse_app_list "$inputs_additional_debian_apps" inputs_additional_debian_apps_array
 
 # Validate platform input for security
 validate_input "$inputs_platform" "platform"
