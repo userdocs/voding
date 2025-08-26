@@ -414,14 +414,47 @@ docker_command+=(
 docker_command+=("-w" "$wd")
 docker_command+=("-v" "$workspace:$wd")
 
-# ghcr.io/userdocs are preconfigured to have root + gh with passwordless sudo so we just need to pull them in
-if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
-	# Create Dockerfile and build image with user setup
+# Check if we need to create a custom Dockerfile for additional packages
+need_custom_dockerfile=false
+if [[ ${#inputs_additional_alpine_apps_array[@]} -gt 0 && "${inputs_additional_alpine_apps_array[0]}" != "" ]]; then
+	need_custom_dockerfile=true
+fi
+if [[ ${#inputs_additional_debian_apps_array[@]} -gt 0 && "${inputs_additional_debian_apps_array[0]}" != "" ]]; then
+	need_custom_dockerfile=true
+fi
+
+if [[ $need_custom_dockerfile == true ]]; then
+	# Create Dockerfile for package installation
 	dockerfile_path="${workspace}/${container_name}_dockerfile"
 	custom_image_tag="${container_name}"
 
 	# Avoid heredoc (EOF) which can break in some CI environments (GitHub Actions).
 	case "$inputs_os_id" in
+		ghcr.io/userdocs/*)
+			log_info "Creating userdocs Dockerfile for additional packages"
+			printf '%b\n' "\`\`\`bash\n" >> "$GITHUB_STEP_SUMMARY"
+			{
+				# Determine package manager based on image name
+				if [[ $inputs_os_id =~ alpine ]]; then
+					df_lines=(
+						"FROM ${inputs_os_id}:${inputs_os_version_id}"
+						""
+						"# Install additional Alpine packages"
+						"RUN apk add --no-cache ${inputs_additional_alpine_apps_array[@]}"
+					)
+				else
+					# Assume Debian/Ubuntu based userdocs image
+					df_lines=(
+						"FROM ${inputs_os_id}:${inputs_os_version_id}"
+						""
+						"# Install additional Debian/Ubuntu packages"
+						"RUN apt-get update && apt-get install -y ${inputs_additional_debian_apps_array[@]} && apt-get clean"
+					)
+				fi
+				printf '%s\n' "${df_lines[@]}"
+			} | tee "$dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
+			printf '%b\n' '```' >> "$GITHUB_STEP_SUMMARY"
+			;;
 		alpine | */alpine)
 			log_info "Creating Alpine Linux Dockerfile"
 			printf '%b\n' "\`\`\`bash\n" >> "$GITHUB_STEP_SUMMARY"
@@ -495,8 +528,8 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 			;;
 	esac
 
-	# Build the custom image with user setup
-	log_info "Building container image with user setup"
+	# Build the custom image
+	log_info "Building container image with additional packages"
 	docker build -f "$dockerfile_path" -t "$custom_image_tag" . || {
 		log_error "Failed to build Docker image"
 		exit 1
@@ -507,7 +540,7 @@ if [[ $inputs_os_id != ghcr.io/userdocs/* ]]; then
 
 	docker_command+=("$custom_image_tag")
 else
-	# For userdocs images, use original image
+	# Use original image without modifications
 	docker_command+=("${inputs_os_id}:${inputs_os_version_id}")
 fi
 
