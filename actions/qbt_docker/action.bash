@@ -75,6 +75,20 @@ validate_input() {
 					;;
 			esac
 			;;
+		"env_var")
+			# Validate environment variable format and block dangerous ones
+			if [[ ! $input =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || [[ $input =~ ^(PATH|LD_|BASH_|SHELL|HOME)= ]]; then
+				log_error "Security: Invalid environment variable blocked: $input"
+				exit 1
+			fi
+			# Check for dangerous characters using case
+			case "$input" in
+				*\;* | *\&* | *\|* | *\<* | *\>*)
+					log_error "Security: Dangerous characters in environment variable: $input"
+					exit 1
+					;;
+			esac
+			;;
 	esac
 }
 
@@ -102,19 +116,6 @@ validate_docker_commands() {
 	done
 }
 
-# Sanitize environment files
-sanitize_env_file() {
-	local input_file="$1"
-	local output_file="$2"
-
-	if [[ -f $input_file ]]; then
-		# Filter valid env vars and block dangerous ones
-		while IFS= read -r line; do
-			[[ -z $line || $line =~ ^[[:space:]]*# ]] && continue
-			validate_input "$line" "env_var" && echo "$line"
-		done < "$input_file" > "$output_file"
-	fi
-}
 
 log_with_level() {
 	local level=$1
