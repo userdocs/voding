@@ -133,25 +133,22 @@ validate_docker_commands() {
 	done
 }
 
-log_with_level() {
-	local level=$1
-	shift
-	if should_log "$level"; then
-		printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" >&2
-	fi
-}
 
-# Functions for consistent logging
+# Functions for consistent logging with level filtering
 log_info() {
-	printf '[INFO] %s\n' "$1"
+	should_log "INFO" && printf '[%s] [INFO] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
 }
 
 log_error() {
-	printf '[ERROR] %s\n' "$1" >&2
+	should_log "ERROR" && printf '[%s] [ERROR] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&2
 }
 
 log_debug() {
-	printf '[DEBUG] %s\n' "$1"
+	should_log "DEBUG" && printf '[%s] [DEBUG] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
+}
+
+log_warn() {
+	should_log "WARN" && printf '[%s] [WARN] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&2
 }
 
 _inputs_info() {
