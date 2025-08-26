@@ -45,7 +45,7 @@ should_log() {
 validate_input() {
 	local input="$1"
 	local type="$2"
-	
+
 	case "$type" in
 		"docker_arg")
 			# Only allow safe docker arguments - whitelist approach
@@ -63,17 +63,17 @@ validate_input() {
 			;;
 		"dockerfile_path")
 			# Restrict to workspace-relative paths only, no traversal
-			if [[ $input =~ \.\.|^/|[;&|<>] ]] || [[ ! $input =~ ^[a-zA-Z0-9._/-]+$ ]] || [[ ${#input} -gt 256 ]]; then
+			if [[ $input =~ \.\.|^/ ]] || [[ ${#input} -gt 256 ]] || [[ ! $input =~ ^[a-zA-Z0-9._/-]+$ ]]; then
 				log_error "Security: Invalid dockerfile path blocked: $input"
 				exit 1
 			fi
-			;;
-		"env_var")
-			# Validate environment variable format and block dangerous ones
-			if [[ ! $input =~ ^[A-Za-z_][A-Za-z0-9_]*=[^;|&<>]*$ ]] || [[ $input =~ ^(PATH|LD_|BASH_|SHELL|HOME)= ]]; then
-				log_error "Security: Invalid environment variable blocked: $input"
-				exit 1
-			fi
+			# Additional check for dangerous characters
+			case "$input" in
+				*\;* | *\&* | *\|* | *\<* | *\>*)
+					log_error "Security: Dangerous characters in dockerfile path: $input"
+					exit 1
+					;;
+			esac
 			;;
 	esac
 }
@@ -81,10 +81,10 @@ validate_input() {
 # Validate Docker commands against whitelist
 validate_docker_commands() {
 	local -a ALLOWED_DOCKER_ARGS=("-e" "--env" "-v" "--volume" "-u" "--user" "-w" "--workdir" "--memory" "--cpus")
-	
+
 	for cmd_line in "${inputs_custom_docker_commands_array[@]}"; do
 		[[ -z ${cmd_line//[[:space:]]/} ]] && continue
-		
+
 		read -ra tokens <<< "$cmd_line"
 		if [[ ${#tokens[@]} -gt 0 ]]; then
 			local found=false
@@ -106,11 +106,11 @@ validate_docker_commands() {
 sanitize_env_file() {
 	local input_file="$1"
 	local output_file="$2"
-	
-	if [[ -f "$input_file" ]]; then
+
+	if [[ -f $input_file ]]; then
 		# Filter valid env vars and block dangerous ones
 		while IFS= read -r line; do
-			[[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+			[[ -z $line || $line =~ ^[[:space:]]*# ]] && continue
 			validate_input "$line" "env_var" && echo "$line"
 		done < "$input_file" > "$output_file"
 	fi
@@ -186,41 +186,80 @@ log_summary() {
 	printf '%b\n' '```' | tee -a "$GITHUB_STEP_SUMMARY"
 }
 
+# Sanitize environment files
+sanitize_env_file() {
+	local input_file="$1"
+	local output_file="$2"
+
+	if [[ -f $input_file ]]; then
+		# Filter valid env vars and block dangerous ones
+		while IFS= read -r line; do
+			[[ -z $line || $line =~ ^[[:space:]]*# ]] && continue
+			# Validate env var format and block dangerous variables
+			if [[ $line =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] && [[ ! $line =~ ^(PATH|LD_|BASH_|SHELL|HOME)= ]]; then
+				# Check for dangerous characters using case
+				case "$line" in
+					*\;* | *\&* | *\|* | *\<* | *\>*)
+						log_error "Security: Dangerous characters in environment variable: $line"
+						;;
+					*)
+						echo "$line"
+						;;
+				esac
+			else
+				log_error "Security: Invalid environment variable blocked: $line"
+			fi
+		done < "$input_file" > "$output_file"
+	fi
+}
+
 if [[ $inputs_use_host_env == 'true' ]]; then
 	env > "${workspace}/env.host"
+	log_info "Security: Host environment dumped - review for sensitive data"
 fi
 
 if [[ -f "${workspace}/env.host" && -f "${workspace}/env.custom" ]]; then
-	cat "${workspace}/env.host" "${workspace}/env.custom" > "${workspace}/env.load"
-	env_custom="host + custom"
+	sanitize_env_file "${workspace}/env.host" "${workspace}/env.host.safe"
+	sanitize_env_file "${workspace}/env.custom" "${workspace}/env.custom.safe"
+	cat "${workspace}/env.host.safe" "${workspace}/env.custom.safe" > "${workspace}/env.load"
+	env_custom="host + custom (sanitized)"
 elif [[ -f "${workspace}/env.host" && ! -f "${workspace}/env.custom" ]]; then
-	cat "${workspace}/env.host" > "${workspace}/env.load"
-	env_custom="host only"
+	sanitize_env_file "${workspace}/env.host" "${workspace}/env.load"
+	env_custom="host only (sanitized)"
 elif [[ ! -f "${workspace}/env.host" && -f "${workspace}/env.custom" ]]; then
-	cat "${workspace}/env.custom" > "${workspace}/env.load"
-	env_custom="custom only"
+	sanitize_env_file "${workspace}/env.custom" "${workspace}/env.load"
+	env_custom="custom only (sanitized)"
 else
 	env_custom="none"
 fi
 
-# Only add env-file if merged file exists
-if [[ -f "${workspace}/env.load" ]]; then
+# Only add env-file if merged file exists and is not empty
+if [[ -f "${workspace}/env.load" && -s "${workspace}/env.load" ]]; then
 	docker_command+=("--env-file" "${workspace}/env.load")
 fi
 
 # Note: The yml coming through from the action with is new line separated not space separated
 
-# Parse the additional docker apps string into an array
+# Parse and validate additional docker apps
 IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
 IFS=$'\n' read -r -a inputs_additional_debian_apps_array <<< "$(printf '%s' "$inputs_additional_debian_apps" | tr -d '\r')"
+
+# Validate package names for security
+for pkg in "${inputs_additional_alpine_apps_array[@]}"; do
+	[[ -n $pkg ]] && validate_input "$pkg" "package_name"
+done
+for pkg in "${inputs_additional_debian_apps_array[@]}"; do
+	[[ -n $pkg ]] && validate_input "$pkg" "package_name"
+done
 
 # $INPUT_SETTING contains newline-separated items
 # Read lines (preserve empty lines for filtering) and strip CRs
 mapfile -t inputs_custom_docker_commands_array <<< "$(printf '%s' "$inputs_custom_docker_commands" | tr -d '\r')"
 
-# Build a token array suitable for passing to docker run.
-# Handle lines like: -e LDFLAGS=...  -> should become two tokens: -e and LDFLAGS=...
-# Also preserve quoted values and split on whitespace otherwise.
+# Validate docker commands before parsing
+validate_docker_commands
+
+# Build a secure token array for docker run - only allow whitelisted arguments
 clean_envs=()
 for e in "${inputs_custom_docker_commands_array[@]}"; do
 	# Skip empty or whitespace-only lines
@@ -231,41 +270,49 @@ for e in "${inputs_custom_docker_commands_array[@]}"; do
 	# Trim leading/trailing whitespace
 	e_trim=$(printf '%s' "$e" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
-	# If entry starts with -e followed by space, split into two args: -e and the rest
-	# If entry starts with a single-letter short flag followed by space (e.g. -v /host:/container or -u 1001:1001),
-	# split into two args: '-v' and the rest. Do NOT split combined flags like -it.
-	if [[ $e_trim =~ ^-([A-Za-z0-9])[[:space:]]+(.+) ]]; then
+	# Parse securely - only process whitelisted arguments
+	if [[ $e_trim =~ ^-([evuw])[[:space:]]+(.+) ]]; then
 		clean_envs+=("-${BASH_REMATCH[1]}")
-		# expand whitelisted variables in the value part before appending
+		# Only expand safe variables (wd only)
 		_val="${BASH_REMATCH[2]}"
-		# Expand wd in all possible forms, including inside quotes and arrays
 		_val="${_val//\$\{wd\}/$wd}"
 		_val="${_val//\$wd/$wd}"
+		# Additional security: prevent command substitution
+		if [[ $_val =~ \$\(|\`|\$\{[^wd] ]]; then
+			log_error "Security: Command substitution blocked in: $_val"
+			exit 1
+		fi
 		clean_envs+=("$_val")
 		continue
 	fi
 
-	# If entry starts with a long option followed by space (e.g. --env VAR=... or --volume /host:/container),
-	# split into two args: '--env' and the rest. Leave equals-form (--env=VAL) untouched.
-	if [[ $e_trim =~ ^(--[^[:space:]=]+)[[:space:]]+(.+) ]]; then
+	# Handle long options securely
+	if [[ $e_trim =~ ^(--(?:env|volume|user|workdir|memory|cpus))[[:space:]]+(.+) ]]; then
 		clean_envs+=("${BASH_REMATCH[1]}")
-		# expand whitelisted variables in the value part before appending
 		_val="${BASH_REMATCH[2]}"
-		# Expand wd in all possible forms, including inside quotes and arrays
 		_val="${_val//\$\{wd\}/$wd}"
 		_val="${_val//\$wd/$wd}"
+		# Additional security check
+		if [[ $_val =~ \$\(|\`|\$\{[^wd] ]]; then
+			log_error "Security: Command substitution blocked in: $_val"
+			exit 1
+		fi
 		clean_envs+=("$_val")
 		continue
 	fi
 
-	# Otherwise split the trimmed line into words honoring shell quoting
-	# read -r -a will split on IFS (spaces) and preserve quoted groups
+	# For other formats, split carefully and validate each token
 	read -r -a tokens <<< "$e_trim"
 	for t in "${tokens[@]}"; do
-		# expand whitelisted variables in each token before appending
+		# Only expand safe variables
 		_t="$t"
 		_t="${_t//\$\{wd\}/$wd}"
 		_t="${_t//\$wd/$wd}"
+		# Security check for command substitution
+		if [[ $_t =~ \$\(|\`|\$\{[^wd] ]]; then
+			log_error "Security: Command substitution blocked in: $_t"
+			exit 1
+		fi
 		clean_envs+=("$_t")
 	done
 done
@@ -280,25 +327,18 @@ if [[ -n $inputs_dockerfile ]]; then
 
 	case "$inputs_dockerfile" in
 		http://* | https://*)
-			log_info "Downloading Dockerfile from URL: $inputs_dockerfile"
-			curl -fsSL "$inputs_dockerfile" -o "$dockerfile_path" || {
-				log_error "Failed to download Dockerfile from $inputs_dockerfile"
-				exit 1
-			}
+			log_error "Security: Remote Dockerfiles not allowed for security reasons"
+			exit 1
 			;;
 		*)
-			if [[ -f $inputs_dockerfile ]]; then
-				cp "$inputs_dockerfile" "$dockerfile_path" || {
-					log_error "Failed to copy Dockerfile from $inputs_dockerfile to $dockerfile_path"
-					exit 1
-				}
-			elif [[ -f "$workspace/$inputs_dockerfile" ]]; then
+			validate_input "$inputs_dockerfile" "dockerfile_path"
+			if [[ -f "$workspace/$inputs_dockerfile" ]]; then
 				cp "$workspace/$inputs_dockerfile" "$dockerfile_path" || {
 					log_error "Failed to copy Dockerfile from $workspace/$inputs_dockerfile to $dockerfile_path"
 					exit 1
 				}
 			else
-				log_error "Dockerfile not found at '$inputs_dockerfile' or '$workspace/$inputs_dockerfile'"
+				log_error "Dockerfile not found at '$workspace/$inputs_dockerfile'"
 				exit 1
 			fi
 			;;
@@ -359,6 +399,17 @@ fi
 if [[ $inputs_use_root == "false" ]]; then
 	docker_command+=("-u" "${non_root_uid}:${non_root_gid}")
 fi
+
+# Security hardening: Add Docker security options
+docker_command+=(
+	"--security-opt" "no-new-privileges:true"
+	"--cap-drop" "ALL"
+	"--cap-add" "CHOWN,DAC_OVERRIDE,FOWNER,SETUID,SETGID"
+	"--memory" "2g"
+	"--cpus" "2.0"
+	"--pids-limit" "1024"
+	"--ulimit" "nofile=65536:65536"
+)
 
 docker_command+=("-w" "$wd")
 docker_command+=("-v" "$workspace:$wd")
