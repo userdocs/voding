@@ -486,12 +486,24 @@ docker_command+=(
 docker_command+=("-w" "$wd")
 docker_command+=("-v" "$workspace:$wd")
 
-# Check if we need to create a custom Dockerfile for additional packages
+# Check if we need to create a custom Dockerfile for additional packages or customizations
 need_custom_dockerfile=false
+
+# Check for additional packages
 if [[ ${#inputs_additional_alpine_apps_array[@]} -gt 0 && ${inputs_additional_alpine_apps_array[0]} != "" ]]; then
 	need_custom_dockerfile=true
 fi
 if [[ ${#inputs_additional_debian_apps_array[@]} -gt 0 && ${inputs_additional_debian_apps_array[0]} != "" ]]; then
+	need_custom_dockerfile=true
+fi
+
+# Check for custom docker commands (beyond basic security hardening)
+if [[ ${#clean_envs[@]} -gt 0 ]]; then
+	need_custom_dockerfile=true
+fi
+
+# For non-userdocs images, always need custom dockerfile for user setup
+if [[ ! $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
 	need_custom_dockerfile=true
 fi
 
@@ -629,7 +641,8 @@ if [[ $need_custom_dockerfile == true ]]; then
 
 	docker_command+=("$custom_image_tag")
 else
-	# Use original image without modifications
+	# Use original image without modifications - no custom Dockerfile needed
+	log_info "Using userdocs image directly without customizations: ${inputs_os_id}:${inputs_os_version_id}"
 	docker_command+=("${inputs_os_id}:${inputs_os_version_id}")
 fi
 
