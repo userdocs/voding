@@ -35,6 +35,8 @@ readonly workspace="${GITHUB_WORKSPACE:-$PWD}"
 # Declare arrays and variables early
 declare -a docker_command=()
 declare -a clean_envs=()
+declare -a inputs_additional_alpine_apps_array=()
+declare -a inputs_additional_debian_apps_array=()
 declare dockerfile_path=""
 declare custom_image_tag=""
 declare env_custom=""
@@ -500,7 +502,7 @@ if [[ $need_custom_dockerfile == true ]]; then
 						"FROM ${inputs_os_id}:${inputs_os_version_id}"
 						""
 						"# Install additional Debian/Ubuntu packages"
-						"RUN apt-get update && apt-get install -y ${inputs_additional_debian_apps_array[@]} && apt-get clean"
+						"RUN apt-get update && apt-get install -y ${inputs_additional_debian_apps_array[*]} && apt-get clean"
 					)
 				else
 					# Use Alpine packages (default)
@@ -508,7 +510,7 @@ if [[ $need_custom_dockerfile == true ]]; then
 						"FROM ${inputs_os_id}:${inputs_os_version_id}"
 						""
 						"# Install additional Alpine packages"
-						"RUN apk add --no-cache ${inputs_additional_alpine_apps_array[@]}"
+						"RUN apk add --no-cache ${inputs_additional_alpine_apps_array[*]}"
 					)
 				fi
 				printf '%s\n' "${df_lines[@]}"
@@ -524,7 +526,7 @@ if [[ $need_custom_dockerfile == true ]]; then
 					"FROM ${inputs_os_id}:${inputs_os_version_id}"
 					""
 					"# Install packages, create group/user and configure sudo"
-					"RUN apk add --no-cache sudo bash ${inputs_additional_alpine_apps_array[@]} && ${backslash}"
+					"RUN apk add --no-cache sudo bash ${inputs_additional_alpine_apps_array[*]} && ${backslash}"
 					"    addgroup -g ${non_root_gid} ${non_root_user} && ${backslash}"
 					"    adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} -G ${non_root_user} ${non_root_user} && ${backslash}"
 					"    umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && ${backslash}"
@@ -549,7 +551,7 @@ if [[ $need_custom_dockerfile == true ]]; then
 					""
 					"# Update packages, install dependencies, create user/group and configure sudo"
 					"RUN apt-get update && apt-get upgrade -y && ${backslash}"
-					"    apt-get install -y sudo ${inputs_additional_debian_apps_array[@]} && ${backslash}"
+					"    apt-get install -y sudo ${inputs_additional_debian_apps_array[*]} && ${backslash}"
 					"    groupadd -g ${non_root_gid} ${non_root_user} && ${backslash}"
 					"    useradd -ms /bin/bash -u ${non_root_uid} -g ${non_root_gid} ${non_root_user} && ${backslash}"
 					"    umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && ${backslash}"
@@ -574,9 +576,9 @@ if [[ $need_custom_dockerfile == true ]]; then
 					""
 					"# Try to install sudo, create group/user (basic fallback) and configure sudo if present"
 					"RUN if command -v apt-get >/dev/null 2>&1; then ${backslash}"
-					"    apt-get update >/dev/null 2>&1 && apt-get install -y sudo ${inputs_additional_debian_apps_array[@]} >/dev/null 2>&1; ${backslash}"
+					"    apt-get update >/dev/null 2>&1 && apt-get install -y sudo ${inputs_additional_debian_apps_array[*]} >/dev/null 2>&1; ${backslash}"
 					"  elif command -v apk >/dev/null 2>&1; then ${backslash}"
-					"    apk add --no-cache sudo ${inputs_additional_alpine_apps_array[@]} >/dev/null 2>&1; ${backslash}"
+					"    apk add --no-cache sudo ${inputs_additional_alpine_apps_array[*]} >/dev/null 2>&1; ${backslash}"
 					"  fi && ${backslash}"
 					"    groupadd -g ${non_root_gid} ${non_root_user} 2>/dev/null || addgroup ${non_root_gid} 2>/dev/null || true && ${backslash}"
 					"    useradd -ms /bin/bash -u ${non_root_uid} ${non_root_user} 2>/dev/null || adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} ${non_root_user} 2>/dev/null || true && ${backslash}"
