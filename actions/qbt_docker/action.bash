@@ -12,6 +12,7 @@ inputs_additional_alpine_apps="${inputs_additional_alpine_apps:-}"
 inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
 inputs_dockerfile="${inputs_dockerfile:-}"
 inputs_userdocs_base="${inputs_userdocs_base:-alpine}"
+
 # Set default platform based on runner architecture
 case "${RUNNER_ARCH:-}" in
 	"X86") default_platform="linux/i386" ;;
