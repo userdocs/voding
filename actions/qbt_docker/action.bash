@@ -133,7 +133,6 @@ validate_docker_commands() {
 	done
 }
 
-
 # Functions for consistent logging with level filtering
 log_info() {
 	should_log "INFO" && printf '[%s] [INFO] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
@@ -259,26 +258,26 @@ fi
 parse_app_list() {
 	local input="$1"
 	local -n result_array=$2
-	
+
 	# Clear the result array
 	result_array=()
-	
-	if [[ -z "$input" ]]; then
+
+	if [[ -z $input ]]; then
 		return
 	fi
-	
+
 	# Remove carriage returns and convert newlines to spaces
 	local normalized_input
 	normalized_input=$(printf '%s' "$input" | tr -d '\r' | tr '\n' ' ')
-	
+
 	# Split on whitespace to handle different YAML formats
 	local temp_array
 	read -r -a temp_array <<< "$normalized_input"
-	
+
 	# Filter out empty elements
 	local item
 	for item in "${temp_array[@]}"; do
-		if [[ -n "$item" ]]; then
+		if [[ -n $item ]]; then
 			result_array+=("$item")
 		fi
 	done
