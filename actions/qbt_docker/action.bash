@@ -11,6 +11,7 @@ inputs_custom_docker_commands="${inputs_custom_docker_commands:-}"
 inputs_additional_alpine_apps="${inputs_additional_alpine_apps:-}"
 inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
 inputs_dockerfile="${inputs_dockerfile:-}"
+inputs_userdocs_base="${inputs_userdocs_base:-alpine}"
 # Set default platform based on runner architecture
 case "${RUNNER_ARCH:-}" in
 	"X86") default_platform="linux/i386" ;;
@@ -106,6 +107,13 @@ validate_input() {
 				exit 1
 			fi
 			;;
+		"userdocs_base")
+			# Validate userdocs base OS (alpine or debian)
+			if [[ ! $input =~ ^(alpine|debian)$ ]]; then
+				log_error "Security: Invalid userdocs base OS blocked: $input"
+				exit 1
+			fi
+			;;
 	esac
 }
 
@@ -155,6 +163,7 @@ _inputs_info() {
 	log_debug "Input info:"
 	log_debug ""
 	log_debug "inputs_dockerfile=\"${inputs_dockerfile}\""
+	log_debug "inputs_userdocs_base=\"${inputs_userdocs_base}\""
 	log_debug "inputs_use_host_env=\"${inputs_use_host_env}\""
 	log_debug "inputs_use_root=\"${inputs_use_root}\""
 	log_debug "inputs_os_id=\"${inputs_os_id}\""
@@ -288,6 +297,9 @@ parse_app_list "$inputs_additional_debian_apps" inputs_additional_debian_apps_ar
 
 # Validate platform input for security
 validate_input "$inputs_platform" "platform"
+
+# Validate userdocs base input for security
+validate_input "$inputs_userdocs_base" "userdocs_base"
 
 # Validate package names for security
 for pkg in "${inputs_additional_alpine_apps_array[@]}"; do
@@ -480,21 +492,22 @@ if [[ $need_custom_dockerfile == true ]]; then
 			log_info "Creating userdocs Dockerfile for additional packages"
 			printf '%b\n' "\`\`\`bash\n" >> "$GITHUB_STEP_SUMMARY"
 			{
-				# Determine package manager based on image name
-				if [[ $inputs_os_id =~ alpine ]]; then
-					df_lines=(
-						"FROM ${inputs_os_id}:${inputs_os_version_id}"
-						""
-						"# Install additional Alpine packages"
-						"RUN apk add --no-cache ${inputs_additional_alpine_apps_array[@]}"
-					)
-				else
-					# Assume Debian/Ubuntu based userdocs image
+				# Determine package manager based on userdocs_base input
+				if [[ $inputs_userdocs_base == "debian" ]]; then
+					# Use Debian packages
 					df_lines=(
 						"FROM ${inputs_os_id}:${inputs_os_version_id}"
 						""
 						"# Install additional Debian/Ubuntu packages"
 						"RUN apt-get update && apt-get install -y ${inputs_additional_debian_apps_array[@]} && apt-get clean"
+					)
+				else
+					# Use Alpine packages (default)
+					df_lines=(
+						"FROM ${inputs_os_id}:${inputs_os_version_id}"
+						""
+						"# Install additional Alpine packages"
+						"RUN apk add --no-cache ${inputs_additional_alpine_apps_array[@]}"
 					)
 				fi
 				printf '%s\n' "${df_lines[@]}"
