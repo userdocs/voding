@@ -12,17 +12,16 @@ inputs_additional_alpine_apps="${inputs_additional_alpine_apps:-}"
 inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
 inputs_dockerfile="${inputs_dockerfile:-}"
 inputs_userdocs_base="${inputs_userdocs_base:-alpine}"
+inputs_platform="${inputs_platform:-linux/amd64}"
 
 # Set default platform based on runner architecture
 case "${RUNNER_ARCH:-}" in
-	"X86") default_platform="linux/i386" ;;
-	"X64") default_platform="linux/amd64" ;;
-	"ARM") default_platform="linux/arm/v7" ;;
-	"ARM64") default_platform="linux/arm64" ;;
-	*) default_platform="linux/amd64" ;; # fallback to amd64
+	"X86") inputs_platform="linux/i386" ;;
+	"X64") inputs_platform="linux/amd64" ;;
+	"ARM") inputs_platform="linux/arm/v7" ;;
+	"ARM64") inputs_platform="linux/arm64" ;;
+	*) inputs_platform="linux/amd64" ;; # fallback to amd64
 esac
-
-inputs_platform="${inputs_platform:-$default_platform}"
 
 # These variables are immutable and cannot be changed by injection or used to run subshell commands.
 readonly container_name="qbt_builder"
@@ -47,10 +46,10 @@ declare -r LOG_LEVEL="${LOG_LEVEL:-INFO}"
 should_log() {
 	local level=$1
 	case "$LOG_LEVEL" in
-		DEBUG) return 0 ;;
-		INFO) [[ $level != "DEBUG" ]] ;;
-		WARN) [[ $level =~ ^(WARN|ERROR)$ ]] ;;
-		ERROR) [[ $level == "ERROR" ]] ;;
+		DEBUG) return 0 ;;                           # Show all levels
+		INFO) [[ $level =~ ^(INFO|WARN|ERROR)$ ]] ;; # Show INFO, WARN, ERROR
+		WARN) [[ $level =~ ^(WARN|ERROR)$ ]] ;;      # Show WARN, ERROR only
+		ERROR) [[ $level == "ERROR" ]] ;;            # Show ERROR only
 		*) return 1 ;;
 	esac
 }
@@ -146,19 +145,27 @@ validate_docker_commands() {
 
 # Functions for consistent logging with level filtering
 log_info() {
-	should_log "INFO" && printf '[%s] [INFO] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
+	if should_log "INFO"; then
+		printf '[%s] [INFO] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
+	fi
 }
 
 log_error() {
-	should_log "ERROR" && printf '[%s] [ERROR] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&2
+	if should_log "ERROR"; then
+		printf '[%s] [ERROR] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&2
+	fi
 }
 
 log_debug() {
-	should_log "DEBUG" && printf '[%s] [DEBUG] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
+	if should_log "DEBUG"; then
+		printf '[%s] [DEBUG] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
+	fi
 }
 
 log_warn() {
-	should_log "WARN" && printf '[%s] [WARN] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&2
+	if should_log "WARN"; then
+		printf '[%s] [WARN] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&2
+	fi
 }
 
 _inputs_info() {
@@ -465,7 +472,11 @@ docker_command+=(
 	"--platform" "$inputs_platform"
 	"--security-opt" "no-new-privileges:true"
 	"--cap-drop" "ALL"
-	"--cap-add" "CHOWN,DAC_OVERRIDE,FOWNER,SETUID,SETGID"
+	"--cap-add" "CHOWN"
+	"--cap-add" "DAC_OVERRIDE"
+	"--cap-add" "FOWNER"
+	"--cap-add" "SETUID"
+	"--cap-add" "SETGID"
 	"--memory" "2g"
 	"--cpus" "2.0"
 	"--pids-limit" "1024"
@@ -498,20 +509,36 @@ if [[ $need_custom_dockerfile == true ]]; then
 				# Determine package manager based on userdocs_base input
 				if [[ $inputs_userdocs_base == "debian" ]]; then
 					# Use Debian packages
-					df_lines=(
-						"FROM ${inputs_os_id}:${inputs_os_version_id}"
-						""
-						"# Install additional Debian/Ubuntu packages"
-						"RUN apt-get update && apt-get install -y ${inputs_additional_debian_apps_array[*]} && apt-get clean"
-					)
+					if [[ ${#inputs_additional_debian_apps_array[@]} -gt 0 && -n "${inputs_additional_debian_apps_array[0]}" ]]; then
+						df_lines=(
+							"FROM ${inputs_os_id}:${inputs_os_version_id}"
+							""
+							"# Install additional Debian/Ubuntu packages"
+							"RUN apt-get update && apt-get install -y ${inputs_additional_debian_apps_array[*]} && apt-get clean"
+						)
+					else
+						df_lines=(
+							"FROM ${inputs_os_id}:${inputs_os_version_id}"
+							""
+							"# No additional packages to install"
+						)
+					fi
 				else
 					# Use Alpine packages (default)
-					df_lines=(
-						"FROM ${inputs_os_id}:${inputs_os_version_id}"
-						""
-						"# Install additional Alpine packages"
-						"RUN apk add --no-cache ${inputs_additional_alpine_apps_array[*]}"
-					)
+					if [[ ${#inputs_additional_alpine_apps_array[@]} -gt 0 && -n "${inputs_additional_alpine_apps_array[0]}" ]]; then
+						df_lines=(
+							"FROM ${inputs_os_id}:${inputs_os_version_id}"
+							""
+							"# Install additional Alpine packages"
+							"RUN apk add --no-cache ${inputs_additional_alpine_apps_array[*]}"
+						)
+					else
+						df_lines=(
+							"FROM ${inputs_os_id}:${inputs_os_version_id}"
+							""
+							"# No additional packages to install"
+						)
+					fi
 				fi
 				printf '%s\n' "${df_lines[@]}"
 			} | tee "$dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -526,7 +553,7 @@ if [[ $need_custom_dockerfile == true ]]; then
 					"FROM ${inputs_os_id}:${inputs_os_version_id}"
 					""
 					"# Install packages, create group/user and configure sudo"
-					"RUN apk add --no-cache sudo bash ${inputs_additional_alpine_apps_array[*]} && ${backslash}"
+					"RUN apk add --no-cache sudo bash${inputs_additional_alpine_apps_array[*]:+ ${inputs_additional_alpine_apps_array[*]}} && ${backslash}"
 					"    addgroup -g ${non_root_gid} ${non_root_user} && ${backslash}"
 					"    adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} -G ${non_root_user} ${non_root_user} && ${backslash}"
 					"    umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && ${backslash}"
