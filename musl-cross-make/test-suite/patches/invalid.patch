@@ -1,0 +1,7 @@
+--- a/nonexistent.c
++++ b/nonexistent.c
+@@ -1,3 +1,4 @@
+ int main() {
+ 	return 0;
++	// This file does not exist
+ }

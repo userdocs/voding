@@ -1,0 +1,9 @@
+--- a/hello.c
++++ b/hello.c
+@@ -2,5 +2,6 @@
+ 
+ int main() {
+ 	printf("Hello World\n");
++	printf("Patched successfully!\n");
+ 	return 0;
+ }

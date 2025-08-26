@@ -2,6 +2,37 @@
 
 # Discover latest release names for gcc and binutils from sourceware, and
 # populate a small list of GNU mirrors to probe for assets.
+# See: https://mywiki.wooledge.org/BashFAQ for bash best practices
+
+# Global mirrors we will use (ensure bases include the gnu path where needed)
+source_urls=(
+	"https://ftp.gnu.org/gnu"
+	"https://ftpmirror.gnu.org/gnu"
+	"https://mirrors.dotsrc.org/gnu"
+	"https://ftp.snt.utwente.nl/pub/software/gnu"
+)
+
+# Global verbose flag
+verbose=0
+
+# Print helper for INFO/DEBUG output
+print_msg() {
+	local level="$1"
+	local msg="$2"
+	case "$level" in
+		INFO)
+			if [[ $verbose -ge 1 ]]; then
+				printf '[INFO] %s\n' "$msg" >&2
+			fi
+			;;
+		DEBUG)
+			if [[ $verbose -ge 2 ]]; then
+				printf '[DEBUG] %s\n' "$msg" >&2
+			fi
+			;;
+	esac
+}
+
 versions() {
 	local primary_root="https://sourceware.org/pub"
 	local fallback_root="https://mirrorservice.org/sites/sourceware.org/pub"
@@ -12,14 +43,21 @@ versions() {
 	binutils_version_name=""
 
 	for an in "${apps[@]}"; do
+		print_msg "DEBUG" "Discovering ${an} version from sourceware"
 		local latest
 		# Try sourceware first, fall back to mirrorservice if it fails or yields nothing.
 		local list_url_primary="${primary_root}/${an}/releases"
 		local list_url_fallback="${fallback_root}/${an}/releases"
+		print_msg "DEBUG" "Trying primary URL: ${list_url_primary}"
 		local content
 		content=$(curl -sS -L --connect-timeout 5 --max-time 15 "$list_url_primary" 2> /dev/null) || content=""
 		if [[ -z $content ]]; then
+			print_msg "DEBUG" "Primary failed, trying fallback URL: ${list_url_fallback}"
 			content=$(curl -sS -L --connect-timeout 5 --max-time 15 "$list_url_fallback" 2> /dev/null) || content=""
+			if [[ -z $content ]]; then
+				printf '%s\n' "Error: failed to fetch ${an} release information from both primary and fallback sources" >&2
+				return 2
+			fi
 		fi
 
 		if [[ $an == "gcc" ]]; then
@@ -28,6 +66,7 @@ versions() {
 				| sed -rn "s#.*href=\"(${an}-[0-9]+(\.[0-9]+){1,2})/\".*#\1#p" \
 				| sort -V -r | head -n1)
 			gcc_version_name="$latest"
+			print_msg "DEBUG" "Found GCC version: ${gcc_version_name}"
 		else
 			# binutils lists tarballs directly, e.g., binutils-2.45.tar.xz
 			# Extract name-version without the archive extension.
@@ -35,17 +74,10 @@ versions() {
 				| sed -rn "s#.*href=\"(${an}-[0-9]+(\.[0-9]+){1,2})\.tar\.(xz|gz)\".*#\1#p" \
 				| sort -V -r | head -n1)
 			binutils_version_name="$latest"
+			print_msg "DEBUG" "Found binutils version: ${binutils_version_name}"
 		fi
-		# Keep silent: do not print discovered versions.
 	done
 
-	# general mirrors we will use (ensure bases include the gnu path where needed)
-	source_urls=(
-		"https://ftp.gnu.org/gnu"
-		"https://ftpmirror.gnu.org/gnu"
-		"https://mirrors.dotsrc.org/gnu"
-		"https://ftp.snt.utwente.nl/pub/software/gnu"
-	)
 }
 
 # Small helper: returns 0 if URL responds with 2xx/3xx (HEAD with GET fallback), else 1.
@@ -53,26 +85,81 @@ http_ok() {
 	local url="$1"
 	local code
 	code=$(curl -sS -I -L --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' "$url" 2> /dev/null) || code="000"
-	if [[ $code != 2* && $code != 3* ]]; then
+	if [[ ! $code =~ ^[23][0-9][0-9]$ ]]; then
 		code=$(curl -sS -L --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' "$url" 2> /dev/null) || code="000"
 	fi
-	if [[ $code == 2* || $code == 3* ]]; then
+	if [[ $code =~ ^[23][0-9][0-9]$ ]]; then
 		return 0
 	fi
 	return 1
 }
 
+# Test mirror speed by downloading first 64KB and measuring time
+# Returns speed in KB/s, or 0 on failure
+test_mirror_speed() {
+	local mirror="$1"
+	local test_file="binutils/${binutils_version_name}.tar.xz"
+	local test_url="${mirror}/${test_file}"
+	local speed_result
+	
+	print_msg "DEBUG" "Testing speed for mirror: ${mirror}"
+	# Download first 64KB and measure time/speed
+	speed_result=$(curl -sS -L --connect-timeout 5 --max-time 15 \
+		--range 0-65535 -o /dev/null -w '%{speed_download}' \
+		"$test_url" 2> /dev/null) || speed_result="0"
+	
+	# Convert bytes/sec to KB/s and round to integer
+	local speed_kb
+	speed_kb=$(printf '%.0f' "${speed_result%.*}")
+	print_msg "DEBUG" "Speed test result: ${speed_kb} KB/s"
+	printf '%s' "$speed_kb"
+}
+
+# Global variables
+mirror_url=""
+best_speed=0
+
 # Argument handling
-# - If first arg is a URL (http/https), treat it as a preferred mirror (validate later).
+# - Parse verbose flags (-v, -vv)
+# - If first non-flag arg is a URL (http/https), treat it as a preferred mirror (validate later).
 # - Else, if args include gcc/binutils tokens, print versions only and exit.
 preferred_mirror=""
-if [[ $# -gt 0 ]]; then
-	if [[ $1 =~ ^https?:// ]]; then
-		preferred_mirror="${1%/}"
+args=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		-v)
+			verbose=1
+			;;
+		-vv)
+			verbose=2
+			;;
+		*)
+			args+=("$1")
+			;;
+	esac
+	shift
+done
+
+# Process remaining arguments
+if [[ ${#args[@]} -gt 0 ]]; then
+	if [[ ${args[0]} =~ ^https?:// ]]; then
+		# Validate URL format
+		if [[ ! ${args[0]} =~ ^https?://[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*(/.*)?$ ]]; then
+			printf '%s\n' "Error: invalid mirror URL format: ${args[0]}" >&2
+			exit 4
+		fi
+		preferred_mirror="${args[0]%/}"
 	else
-		versions || exit 1
+		if ! versions; then
+			case $? in
+				2) exit 2 ;;
+				*) exit 1 ;;
+			esac
+		fi
 		printed=0
-		for a in "$@"; do
+		for a in "${args[@]}"; do
 			case "$a" in
 				gcc)
 					if [[ -n $gcc_version_name ]]; then
@@ -91,11 +178,12 @@ if [[ $# -gt 0 ]]; then
 		if [[ $printed -eq 1 ]]; then
 			exit 0
 		fi
-		exit 1
+		printf '%s\n' "Error: no valid arguments provided (expected: gcc, binutils, or -v/-vv for verbose)" >&2
+		exit 3
 	fi
 fi
 
-# Linear selection: check each mirror (base), then both assets; stop at first success.
+# Speed-based selection: check each mirror for availability and speed, select fastest.
 find_working_mirror() {
 	# Ensure versions are known
 	if [[ -z $gcc_version_name || -z $binutils_version_name ]]; then
@@ -104,24 +192,43 @@ find_working_mirror() {
 
 	local gcc_rel="gcc/${gcc_version_name}/${gcc_version_name}.tar.xz"
 	local binutils_rel="binutils/${binutils_version_name}.tar.xz"
+	local best_mirror=""
+	best_speed=0
 
 	# If a preferred mirror was provided, try it first.
 	if [[ -n $preferred_mirror ]]; then
 		local m="$preferred_mirror"
+		print_msg "INFO" "Testing preferred mirror: ${m}"
 		if http_ok "${m}/"; then
 			local gcc_url_p="${m}/${gcc_rel}"
 			local bu_url_p="${m}/${binutils_rel}"
+			print_msg "DEBUG" "Checking files on preferred mirror: gcc=${gcc_url_p}, binutils=${bu_url_p}"
 			if http_ok "$gcc_url_p" && http_ok "$bu_url_p"; then
-				mirror_url="$m"
-				return 0
+				print_msg "INFO" "Preferred mirror has both files, testing speed"
+				local speed
+				speed=$(test_mirror_speed "$m")
+				if [[ $speed -gt 0 ]]; then
+					print_msg "INFO" "Using preferred mirror (${speed} KB/s): ${m}"
+					mirror_url="$m"
+					best_speed=$speed
+					return 0
+				fi
+			else
+				print_msg "INFO" "Preferred mirror missing required files"
 			fi
+		else
+			print_msg "INFO" "Preferred mirror not accessible"
 		fi
 		# Fall through to array scan if preferred failed.
 	fi
 
+	# Test all mirrors and find the fastest one
+	print_msg "INFO" "Testing ${#source_urls[@]} mirrors for speed"
 	for mirror in "${source_urls[@]}"; do
-		# Check the mirror base first (linear order)
+		print_msg "DEBUG" "Testing mirror: ${mirror}"
+		# Check the mirror base first
 		if ! http_ok "${mirror}/"; then
+			print_msg "DEBUG" "Mirror not accessible: ${mirror}"
 			continue
 		fi
 
@@ -129,17 +236,33 @@ find_working_mirror() {
 		local gcc_url="${mirror}/${gcc_rel}"
 		local bu_url="${mirror}/${binutils_rel}"
 		local gcc_ok=1 bu_ok=1
+		print_msg "DEBUG" "Checking files: gcc=${gcc_url}, binutils=${bu_url}"
 		if ! http_ok "$gcc_url"; then gcc_ok=0; fi
 		if ! http_ok "$bu_url"; then bu_ok=0; fi
 
 		if [[ $gcc_ok -eq 1 && $bu_ok -eq 1 ]]; then
-			mirror_url="$mirror"
-			return 0
+			print_msg "INFO" "Mirror has both files: ${mirror}"
+			# Test speed of this working mirror
+			local speed
+			speed=$(test_mirror_speed "$mirror")
+			print_msg "INFO" "Mirror speed: ${speed} KB/s (${mirror})"
+			if [[ $speed -gt $best_speed ]]; then
+				best_mirror="$mirror"
+				best_speed=$speed
+				print_msg "INFO" "New fastest mirror: ${mirror} (${speed} KB/s)"
+			fi
+		else
+			print_msg "DEBUG" "Mirror missing files (gcc_ok=${gcc_ok}, bu_ok=${bu_ok}): ${mirror}"
 		fi
-		# Try next mirror in linear order
 	done
 
-	printf '%s\n' "no mirror provided both assets (gcc: ${gcc_version_name}, binutils: ${binutils_version_name})" >&2
+	if [[ -n $best_mirror ]]; then
+		mirror_url="$best_mirror"
+		print_msg "INFO" "Selected fastest mirror: ${best_mirror} (${best_speed} KB/s)"
+		return 0
+	fi
+
+	printf '%s\n' "Error: no mirror provided both assets (gcc: ${gcc_version_name}, binutils: ${binutils_version_name})" >&2
 	return 1
 }
 
@@ -147,7 +270,14 @@ find_working_mirror() {
 # then check assets for gcc and binutils. Stop as soon as each asset is found;
 # returns success only if both are resolved.
 
-versions
-find_working_mirror || exit 1
+if ! versions; then
+	case $? in
+		2) exit 2 ;;
+		*) exit 1 ;;
+	esac
+fi
+if ! find_working_mirror; then
+	exit 5
+fi
 # No-op reference to satisfy linters when sourcing; does not print or change behavior.
 printf '%s\n' "${mirror_url}"
