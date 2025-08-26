@@ -11,6 +11,7 @@ inputs_custom_docker_commands="${inputs_custom_docker_commands:-}"
 inputs_additional_alpine_apps="${inputs_additional_alpine_apps:-}"
 inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
 inputs_dockerfile="${inputs_dockerfile:-}"
+inputs_platform="${inputs_platform:-linux/amd64}"
 
 # These variables are immutable and cannot be changed by injection or used to run subshell commands.
 readonly container_name="qbt_builder"
@@ -89,6 +90,13 @@ validate_input() {
 					;;
 			esac
 			;;
+		"platform")
+			# Validate Docker platform format (linux/amd64, linux/arm64, etc.)
+			if [[ ! $input =~ ^[a-z]+/[a-z0-9]+$ ]] || [[ ${#input} -gt 32 ]]; then
+				log_error "Security: Invalid platform format blocked: $input"
+				exit 1
+			fi
+			;;
 	esac
 }
 
@@ -115,7 +123,6 @@ validate_docker_commands() {
 		fi
 	done
 }
-
 
 log_with_level() {
 	local level=$1
@@ -245,6 +252,9 @@ fi
 IFS=$'\n' read -r -a inputs_additional_alpine_apps_array <<< "$(printf '%s' "$inputs_additional_alpine_apps" | tr -d '\r')"
 IFS=$'\n' read -r -a inputs_additional_debian_apps_array <<< "$(printf '%s' "$inputs_additional_debian_apps" | tr -d '\r')"
 
+# Validate platform input for security
+validate_input "$inputs_platform" "platform"
+
 # Validate package names for security
 for pkg in "${inputs_additional_alpine_apps_array[@]}"; do
 	[[ -n $pkg ]] && validate_input "$pkg" "package_name"
@@ -362,7 +372,7 @@ if [[ -n $inputs_dockerfile ]]; then
 	custom_image_tag="custom_dockerfile"
 
 	log_info "Building image from provided Dockerfile as: $custom_image_tag"
-	docker build -f "$dockerfile_path" -t "$custom_image_tag" . || {
+	docker build --platform "$inputs_platform" -f "$dockerfile_path" -t "$custom_image_tag" . || {
 		log_error "Failed to build Docker image from provided Dockerfile"
 		# Clean up Dockerfile if left behind
 		rm -f "$dockerfile_path"
@@ -417,10 +427,10 @@ docker_command+=("-v" "$workspace:$wd")
 
 # Check if we need to create a custom Dockerfile for additional packages
 need_custom_dockerfile=false
-if [[ ${#inputs_additional_alpine_apps_array[@]} -gt 0 && "${inputs_additional_alpine_apps_array[0]}" != "" ]]; then
+if [[ ${#inputs_additional_alpine_apps_array[@]} -gt 0 && ${inputs_additional_alpine_apps_array[0]} != "" ]]; then
 	need_custom_dockerfile=true
 fi
-if [[ ${#inputs_additional_debian_apps_array[@]} -gt 0 && "${inputs_additional_debian_apps_array[0]}" != "" ]]; then
+if [[ ${#inputs_additional_debian_apps_array[@]} -gt 0 && ${inputs_additional_debian_apps_array[0]} != "" ]]; then
 	need_custom_dockerfile=true
 fi
 
@@ -531,7 +541,7 @@ if [[ $need_custom_dockerfile == true ]]; then
 
 	# Build the custom image
 	log_info "Building container image with additional packages"
-	docker build -f "$dockerfile_path" -t "$custom_image_tag" . || {
+	docker build --platform "$inputs_platform" -f "$dockerfile_path" -t "$custom_image_tag" . || {
 		log_error "Failed to build Docker image"
 		exit 1
 	}
