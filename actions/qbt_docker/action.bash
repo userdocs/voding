@@ -1,15 +1,16 @@
 #!/bin/bash
 
-# # Config (env-overridable)
-# inputs_use_host_env="${inputs_use_host_env:-false}"
-# inputs_use_root="${inputs_use_root:-false}"
-# inputs_os_id="${inputs_os_id:=alpine}"
-# inputs_os_version_id="${inputs_os_version_id:=edge}"
-# inputs_custom_docker_commands="${inputs_custom_docker_commands:-}"
-# inputs_additional_alpine_apps="${inputs_additional_alpine_apps:-}"
-# inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
-# inputs_dockerfile="${inputs_dockerfile:-}"
-# workspace="${GITHUB_WORKSPACE:-$PWD}"
+set -euo pipefail
+
+# Config (env-overridable)
+inputs_use_host_env="${inputs_use_host_env:-false}"
+inputs_use_root="${inputs_use_root:-false}"
+inputs_os_id="${inputs_os_id:=alpine}"
+inputs_os_version_id="${inputs_os_version_id:=edge}"
+inputs_custom_docker_commands="${inputs_custom_docker_commands:-}"
+inputs_additional_alpine_apps="${inputs_additional_alpine_apps:-}"
+inputs_additional_debian_apps="${inputs_additional_debian_apps:-}"
+inputs_dockerfile="${inputs_dockerfile:-}"
 
 # These variables are immutable and cannot be changed by injection or used to run subshell commands.
 readonly container_name="qbt_builder"
@@ -17,6 +18,111 @@ readonly wd="/home/gh"
 readonly non_root_user="gh"
 readonly non_root_uid="1001"
 readonly non_root_gid="1001"
+readonly workspace="${GITHUB_WORKSPACE:-$PWD}"
+
+# Declare arrays and variables early
+declare -a docker_command=()
+declare -a clean_envs=()
+declare dockerfile_path=""
+declare custom_image_tag=""
+declare env_custom=""
+
+# Enhanced logging with levels
+declare -r LOG_LEVEL="${LOG_LEVEL:-INFO}"
+
+should_log() {
+	local level=$1
+	case "$LOG_LEVEL" in
+		DEBUG) return 0 ;;
+		INFO) [[ $level != "DEBUG" ]] ;;
+		WARN) [[ $level =~ ^(WARN|ERROR)$ ]] ;;
+		ERROR) [[ $level == "ERROR" ]] ;;
+		*) return 1 ;;
+	esac
+}
+
+# Security input validation functions
+validate_input() {
+	local input="$1"
+	local type="$2"
+	
+	case "$type" in
+		"docker_arg")
+			# Only allow safe docker arguments - whitelist approach
+			if [[ ! $input =~ ^(-[evuw]|--env|--volume|--user|--workdir)$ ]]; then
+				log_error "Security: Invalid docker argument blocked: $input"
+				exit 1
+			fi
+			;;
+		"package_name")
+			# Validate package names (alphanumeric, hyphens, dots, plus signs)
+			if [[ ! $input =~ ^[a-zA-Z0-9.+_-]+$ ]] || [[ ${#input} -gt 128 ]]; then
+				log_error "Security: Invalid package name blocked: $input"
+				exit 1
+			fi
+			;;
+		"dockerfile_path")
+			# Restrict to workspace-relative paths only, no traversal
+			if [[ $input =~ \.\.|^/|[;&|<>] ]] || [[ ! $input =~ ^[a-zA-Z0-9._/-]+$ ]] || [[ ${#input} -gt 256 ]]; then
+				log_error "Security: Invalid dockerfile path blocked: $input"
+				exit 1
+			fi
+			;;
+		"env_var")
+			# Validate environment variable format and block dangerous ones
+			if [[ ! $input =~ ^[A-Za-z_][A-Za-z0-9_]*=[^;|&<>]*$ ]] || [[ $input =~ ^(PATH|LD_|BASH_|SHELL|HOME)= ]]; then
+				log_error "Security: Invalid environment variable blocked: $input"
+				exit 1
+			fi
+			;;
+	esac
+}
+
+# Validate Docker commands against whitelist
+validate_docker_commands() {
+	local -a ALLOWED_DOCKER_ARGS=("-e" "--env" "-v" "--volume" "-u" "--user" "-w" "--workdir" "--memory" "--cpus")
+	
+	for cmd_line in "${inputs_custom_docker_commands_array[@]}"; do
+		[[ -z ${cmd_line//[[:space:]]/} ]] && continue
+		
+		read -ra tokens <<< "$cmd_line"
+		if [[ ${#tokens[@]} -gt 0 ]]; then
+			local found=false
+			for allowed in "${ALLOWED_DOCKER_ARGS[@]}"; do
+				if [[ ${tokens[0]} == "$allowed" ]]; then
+					found=true
+					break
+				fi
+			done
+			if [[ $found == false ]]; then
+				log_error "Security: Forbidden docker argument blocked: ${tokens[0]}"
+				exit 1
+			fi
+		fi
+	done
+}
+
+# Sanitize environment files
+sanitize_env_file() {
+	local input_file="$1"
+	local output_file="$2"
+	
+	if [[ -f "$input_file" ]]; then
+		# Filter valid env vars and block dangerous ones
+		while IFS= read -r line; do
+			[[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+			validate_input "$line" "env_var" && echo "$line"
+		done < "$input_file" > "$output_file"
+	fi
+}
+
+log_with_level() {
+	local level=$1
+	shift
+	if should_log "$level"; then
+		printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" >&2
+	fi
+}
 
 # Functions for consistent logging
 log_info() {
