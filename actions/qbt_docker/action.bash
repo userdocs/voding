@@ -383,7 +383,7 @@ if [[ -n $inputs_dockerfile ]]; then
 
 	# Start a container (detached) from the built image so it's running like a daemon.
 	log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
-	docker run -it -d --name "${container_name}" "${clean_envs[@]}" "${docker_command[@]}" || {
+	docker run -it -d --platform "$inputs_platform" --name "${container_name}" "${clean_envs[@]}" "${docker_command[@]}" || {
 		log_error "Failed to start container from image $custom_image_tag"
 		rm -f "$dockerfile_path"
 		exit 1
@@ -413,6 +413,7 @@ fi
 
 # Security hardening: Add Docker security options
 docker_command+=(
+	"--platform" "$inputs_platform"
 	"--security-opt" "no-new-privileges:true"
 	"--cap-drop" "ALL"
 	"--cap-add" "CHOWN,DAC_OVERRIDE,FOWNER,SETUID,SETGID"
