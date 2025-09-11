@@ -8,8 +8,10 @@
 source_urls=(
 	"https://ftp.gnu.org/gnu"
 	"https://ftpmirror.gnu.org/gnu"
+	"http://mirrors.kernel.org/gnu"
 	"https://mirrors.dotsrc.org/gnu"
 	"https://ftp.snt.utwente.nl/pub/software/gnu"
+
 )
 
 # Global verbose flag
@@ -101,13 +103,13 @@ test_mirror_speed() {
 	local test_file="binutils/${binutils_version_name}.tar.xz"
 	local test_url="${mirror}/${test_file}"
 	local speed_result
-	
+
 	print_msg "DEBUG" "Testing speed for mirror: ${mirror}"
 	# Download first 64KB and measure time/speed
 	speed_result=$(curl -sS -L --connect-timeout 5 --max-time 15 \
 		--range 0-65535 -o /dev/null -w '%{speed_download}' \
 		"$test_url" 2> /dev/null) || speed_result="0"
-	
+
 	# Convert bytes/sec to KB/s and round to integer
 	local speed_kb
 	speed_kb=$(printf '%.0f' "${speed_result%.*}")
