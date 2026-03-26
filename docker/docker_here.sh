@@ -1,5 +1,8 @@
 #!/bin/bash
 _dh() {
+	set -eo pipefail
+	# Isolate error checking to avoid unexpected exits from `set -e`
+	trap '[[ $? -eq 0 ]] || printf "\\n%b\\n" "${unicode_red_circle} ${color_red}ERROR:${color_end} An unexpected error occurred. Exiting." >&2' EXIT
 	# Helper: robust docker exec attach with fallback and quick-exit diagnostics
 	attach_shell() {
 		local user="$1"
@@ -11,7 +14,7 @@ _dh() {
 		local shell_cmd
 		if [[ ${prefer_bash} == true ]] && docker exec "${container_name}" bash -lc 'command -v bash >/dev/null 2>&1'; then
 			shell_cmd="bash"
-		elif docker exec "${container_name}" sh -lc 'command -v bash >/dev/null 2>&1'; then
+		elif docker exec "${container_name}" sh -lc 'command -v bash >/dev/null 2>&1' > /dev/null 2>&1; then
 			shell_cmd="bash"
 		else
 			shell_cmd="sh"
@@ -22,7 +25,7 @@ _dh() {
 			exec_opts+=(-u "${user}")
 		fi
 		local use_workdir=false
-		if [[ -n ${workdir} ]] && docker exec "${container_name}" sh -lc "test -d '${workdir}'"; then
+		if [[ -n ${workdir} ]] && docker exec "${container_name}" sh -lc "test -d '${workdir}'" > /dev/null 2>&1; then
 			use_workdir=true
 		fi
 		if [[ ${use_workdir} == true ]]; then
@@ -79,7 +82,7 @@ _dh() {
 	local auto_remove=false
 	local quiet=false
 	local delete_all=false
-	local target_user="gh"
+	local target_user="${USER:-gh}"
 	local additional_packages=""
 
 	local host_uid="${SUDO_UID:-$(id -u)}"
@@ -118,8 +121,8 @@ _dh() {
 	local OPTIND=1
 	# (Debug of raw arguments removed to honor -q early)
 	while getopts "aU:udDslP:p:i:v:hnrq" opt; do
-		if [[ ${quiet} == false && ${opt} != h ]]; then
-			printf '\n%b\n' "${unicode_yellow_circle} ${color_yellow}DEBUG:${color_end} Processing option: ${color_magenta}$opt${color_end}"
+		if [[ ${quiet} == false && ${opt} != "h" ]]; then
+			printf '\n%b\n' "${unicode_yellow_circle} ${color_yellow}DEBUG:${color_end} Processing option: ${color_magenta}$opt${color_end}" >&2
 		fi
 		case ${opt} in
 			a)
@@ -150,7 +153,7 @@ _dh() {
 				use_limited=true
 				;;
 			p)
-				docker_platform="${OPTARG}"
+				docker_platform="${OPTARG}" # NOSONAR
 				;;
 			i)
 				if [[ ${OPTARG} =~ ^(alpine|ubuntu|debian):(.+)$ ]]; then
@@ -164,7 +167,7 @@ _dh() {
 				;;
 			v)
 				if [[ -n ${OPTARG} ]]; then
-					local target_dir
+					local target_dir # NOSONAR
 					if [[ ${OPTARG} == /* ]]; then
 						target_dir="${OPTARG}"
 					elif [[ ${OPTARG} == ~* ]]; then
@@ -174,7 +177,7 @@ _dh() {
 						target_dir="$(pwd)/${OPTARG}"
 					fi
 					mkdir -p "${target_dir}" || {
-						printf '%b\n' "Error: Failed to create directory '${target_dir}'" >&2
+						printf '%b\n' "${unicode_red_circle} Error: Failed to create directory '${target_dir}'" >&2
 						return 1
 					}
 					volume_path="${target_dir}"
@@ -226,12 +229,20 @@ _dh() {
 	# Shift past the options
 	shift $((OPTIND - 1))
 
+	# Security: Validate username to prevent command injection.
+	# Usernames typically start with a letter or underscore, followed by letters, digits, hyphens, or underscores.
+	if [[ ! ${target_user} =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+		printf '%b\n' "${unicode_red_circle} ${color_red}ERROR:${color_end} Invalid username specified: '${target_user}'" >&2
+		printf '%b\n' "Usernames must match the regex: ^[a-z_][a-z0-9_-]{0,31}$" >&2
+		return 1
+	fi
+
 	# Security: Validate additional packages to prevent command injection
 	if [[ -n ${additional_packages} ]]; then
 		# Create an array from the space-separated string
 		read -r -a pkg_array <<< "${additional_packages}"
 		for pkg in "${pkg_array[@]}"; do
-			if [[ ! ${pkg} =~ ^[a-zA-Z0-9][a-zA-Z0-9.+_-]+$ ]]; then
+			if [[ ! ${pkg} =~ ^[a-zA-Z0-9][a-zA-Z0-9.+_-]*$ ]]; then
 				printf '%b\n' "${unicode_red_circle} ${color_red}ERROR:${color_end} Invalid package name specified: '${pkg}'" >&2
 				return 1
 			fi
@@ -240,7 +251,7 @@ _dh() {
 
 	# Debug: Show final values
 	if [[ ${quiet} == false ]]; then
-		printf '\n%b\n\n' "${unicode_yellow_circle} ${color_yellow}DEBUG:${color_end} Final values - ${color_blue}image_type=${color_green}\"${image_type}\"${color_end}  ${color_blue}image_version=${color_green}\"${image_version}\"${color_end}  ${color_blue}use_sudo=${color_green}\"${use_sudo}\"${color_end}  ${color_blue}additional_packages=${color_green}\"${additional_packages}\"${color_end}"
+		printf '\n%b\n\n' "${unicode_yellow_circle} ${color_yellow}DEBUG:${color_end} Final values - ${color_blue}image_type=${color_green}\"${image_type}\"${color_end}  ${color_blue}image_version=${color_green}\"${image_version}\"${color_end}  ${color_blue}use_sudo=${color_green}\"${use_sudo}\"${color_end}  ${color_blue}additional_packages=${color_green}\"${additional_packages}\"${color_end}" >&2
 	fi
 
 	# Validate configuration
@@ -261,14 +272,14 @@ _dh() {
 
 	# Ensure volume path exists and is accessible
 	if [[ ! -d ${volume_path} ]]; then
-		printf '%b\n' "Error: Volume path '${volume_path}' does not exist" >&2
+		printf '%b\n' "${unicode_red_circle} Error: Volume path '${volume_path}' does not exist" >&2
 		return 1
 	fi
 
 	# Ensure the chosen volume path is writable, otherwise warn.
 	if [[ ! -w ${volume_path} ]]; then
 		local current_user
-		current_user="$(id -un 2> /dev/null || printf '%s' 'unknown')"
+		current_user="$(id -un 2> /dev/null || echo 'unknown')"
 		printf '%b\n\n' "${unicode_yellow_circle} ${color_yellow}WARNING:${color_end} Volume path '${volume_path}' is not writable by user '${current_user}'. Container operations may fail."
 	fi
 
@@ -293,7 +304,7 @@ _dh() {
 
 	# If requested, delete existing container and its image before proceeding
 	if [[ ${delete_all} == true ]]; then
-		printf '%b %s\n' "${unicode_blue_circle}" "Delete requested (-D): removing existing container and image if present."
+		printf '%b %s\n' "${unicode_blue_circle}" "Delete requested (-D): removing existing container and image if present." >&2
 		# Remove container if it exists
 		local existing_container
 		existing_container=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
@@ -302,14 +313,14 @@ _dh() {
 			local running_container
 			running_container=$(docker ps --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
 			if [[ -n ${running_container} ]]; then
-				printf '%b %s\n' "${unicode_blue_circle}" "Stopping running container '${container_name}'..."
+				printf '%b %s\n' "${unicode_blue_circle}" "Stopping running container '${container_name}'..." >&2
 				docker stop "${container_name}" > /dev/null 2>&1 || true
 			fi
-			printf '%b %s\n' "${unicode_blue_circle}" "Removing container '${container_name}'..."
+			printf '%b %s\n' "${unicode_blue_circle}" "Removing container '${container_name}'..." >&2
 			docker rm -f "${container_name}" > /dev/null 2>&1 || true
 		fi
 		# Attempt to remove image by tag; ignore errors if not present or in use
-		printf '%b %s\n\n' "${unicode_blue_circle}" "Removing image '${image_type}:${image_version}' (if present)..."
+		printf '%b %s\n\n' "${unicode_blue_circle}" "Removing image '${image_type}:${image_version}' (if present)..." >&2
 		docker rmi -f "${image_type}:${image_version}" > /dev/null 2>&1 || true
 		# Ensure we create a fresh container
 		force_new=true
@@ -321,20 +332,20 @@ _dh() {
 		existing_container=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
 
 		if [[ -n ${existing_container} ]]; then
-			printf '%b %s\n' "${unicode_green_circle}" "Reusing existing container: ${existing_container}"
+			printf '%b %s\n' "${unicode_green_circle}" "Reusing existing container: ${existing_container}" >&2
 
 			# Check if container is running
 			local running_container
 			running_container=$(docker ps --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
 
 			if [[ -z ${running_container} ]]; then
-				printf '%b %s\n' "${unicode_blue_circle}" "Starting stopped container..."
+				printf '%b %s\n' "${unicode_blue_circle}" "Starting stopped container..." >&2
 				docker start "${container_name}" > /dev/null || true
 			fi
 
 			# If still exists and running, attach; otherwise fall through to creation
 			if [[ -n ${existing_container} ]]; then
-				printf '%b %s\n' "${unicode_blue_circle}" "Attaching to container..."
+				printf '%b %s\n' "${unicode_blue_circle}" "Attaching to container..." >&2
 
 				# Try to detect user and workdir
 				if [[ -n ${existing_container} ]]; then
@@ -344,6 +355,7 @@ _dh() {
 					else
 						attach_shell "" /root true || rc=$?
 					fi
+					trap - EXIT
 					return ${rc}
 				fi
 			fi
@@ -354,226 +366,128 @@ _dh() {
 		existing_container=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
 
 		if [[ -n ${existing_container} ]]; then
-			printf '%b %s\n' "${unicode_yellow_circle}" "Force new container requested - removing existing container: ${existing_container}"
+			printf '%b %s\n' "${unicode_yellow_circle}" "Force new container requested - removing existing container: ${existing_container}" >&2
 
 			# Stop container if it's running
 			local running_container
 			running_container=$(docker ps --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
 			if [[ -n ${running_container} ]]; then
-				printf '%b %s\n' "${unicode_blue_circle}" "Stopping running container..."
+				printf '%b %s\n' "${unicode_blue_circle}" "Stopping running container..." >&2
 				docker stop "${container_name}" > /dev/null
 			fi
 
 			# Remove the container
-			printf '%b %s\n' "${unicode_blue_circle}" "Removing existing container..."
+			printf '%b %s\n' "${unicode_blue_circle}" "Removing existing container..." >&2
 			docker rm -f "${container_name}" > /dev/null 2>&1 || true
-			printf '%b %s\n\n' "${unicode_green_circle}" "Container removed successfully"
+			printf '%b %s\n\n' "${unicode_green_circle}" "Container removed successfully" >&2
 		fi
 	fi
 
 	# Run appropriate Docker container based on image type
-	local docker_run_opts=(-it --platform "${docker_platform}" --name "${container_name}")
+	local docker_run_opts=(-it --security-opt no-new-privileges --platform "${docker_platform}" --name "${container_name}")
 	if [[ ${auto_remove} == true ]]; then
 		docker_run_opts+=(--rm)
 	fi
 
-	if [[ ${image_type} =~ ^(ubuntu|debian)$ ]]; then
-		local setup_script='
-			set -e
-			export PATH=/usr/sbin:/sbin:$PATH
-			export DEBIAN_FRONTEND=noninteractive
-			apt-get update >/dev/null
-			apt-get install -y --no-install-recommends bash ca-certificates >/dev/null
-		'
-		if [[ -n ${additional_packages} ]]; then
-			setup_script+="apt-get install -y --no-install-recommends ${additional_packages} >/dev/null;"
-		fi
-		if [[ ${use_sudo} == true || ${use_limited} == true ]]; then
-			setup_script+="
-				if ! getent group ${host_gid} >/dev/null; then groupadd -g ${host_gid} ${target_user}; fi
-				EXISTING_USER_NAME=\$(getent passwd ${host_uid} | cut -d: -f1)
-				if [[ -z \"\$EXISTING_USER_NAME\" ]]; then
-					useradd --create-home --shell /bin/bash -u ${host_uid} -g ${host_gid} ${target_user}
-				elif [[ \"\$EXISTING_USER_NAME\" != \"${target_user}\" ]]; then
-					usermod -l ${target_user} -d /home/${target_user} -m \"\$EXISTING_USER_NAME\"
-					if getent group \"\$EXISTING_USER_NAME\" >/dev/null; then groupmod -n ${target_user} \"\$EXISTING_USER_NAME\" 2>/dev/null || true; fi
-				fi
-				mkdir -p /home/${target_user}
-				chown ${host_uid}:${host_gid} /home/${target_user}
-			"
-			if [[ ${use_sudo} == true ]]; then
-				setup_script+="
-					apt-get install -y --no-install-recommends sudo >/dev/null
-					printf '%s\n' '${target_user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/${target_user}
-					chmod 0440 /etc/sudoers.d/${target_user}
-				"
-			fi
-		fi
-
-		# Ephemeral: run setup inline, then shell as PID 1
-		if [[ ${auto_remove} == true ]]; then
-			local ephemeral_cmd="${setup_script}"
-			if [[ ${use_sudo} == true || ${use_limited} == true ]]; then
-				ephemeral_cmd+="; exec su - ${target_user}"
-				docker run "${docker_run_opts[@]}" \
-					-w "/home/${target_user}" \
-					-e "LANG=C.UTF-8" -e "DEBIAN_FRONTEND=noninteractive" -e "TZ=Europe/London" \
-					-v "${volume_path}:/home/${target_user}" \
-					"${image_type}:${image_version}" \
-					sh -c "${ephemeral_cmd}"
-			else
-				ephemeral_cmd+="; exec bash"
-				docker run "${docker_run_opts[@]}" \
-					-w /root \
-					-e "LANG=C.UTF-8" -e "DEBIAN_FRONTEND=noninteractive" -e "TZ=Europe/London" \
-					-v "${volume_path}:/root" \
-					"${image_type}:${image_version}" \
-					sh -c "${ephemeral_cmd}"
-			fi
-		else
-			# Persistent: create or ensure running, then exec into shell
-			if ! docker ps -a --format '{{.Names}}' | grep -qx "${container_name}"; then
-				local persistent_run_opts=(-d --init --platform "${docker_platform}" --name "${container_name}")
-				docker run "${persistent_run_opts[@]}" \
-					-e LANG=C.UTF-8 -e DEBIAN_FRONTEND=noninteractive -e TZ=Europe/London \
-					-v "${volume_path}:/root" -v "${volume_path}:/home/${target_user}" \
-					"${image_type}:${image_version}" tail -f /dev/null
-			else
-				docker start "${container_name}" > /dev/null || true
-			fi
-
-			docker exec "${container_name}" sh -c "${setup_script}" || {
-				printf '%b\n' "${unicode_red_circle} Error: Failed to setup persistent container." >&2
-				return 1
-			}
-
-			# Attach via helper
-			if [[ ${use_sudo} == true || ${use_limited} == true ]]; then
-				attach_shell "${target_user}" "/home/${target_user}" true
-			else
-				attach_shell "" /root true
-			fi
-		fi
-	elif [[ ${image_type} =~ ^(alpine)$ ]]; then
-		# Ephemeral
-		if [[ ${auto_remove} == true ]]; then
-			local container_cmd="
-				apk update >/dev/null 2>&1 || true
-				apk add --no-cache bash >/dev/null 2>&1 || true
-			"
-			if [[ -n ${additional_packages} ]]; then
-				container_cmd+="
-					apk add --no-cache ${additional_packages} >/dev/null 2>&1 || true
-				"
-			fi
-			if [[ ${use_sudo} == true || ${use_limited} == true ]]; then
-				container_cmd+="
-					if id -u ${target_user} >/dev/null 2>&1; then
-						if [ \"\$(id -u ${target_user})\" != \"${host_uid}\" ]; then
-							apk add --no-cache shadow >/dev/null 2>&1 || true
-							usermod -u ${host_uid} ${target_user} 2>/dev/null || true
-						fi
-					else
-						existing_user=\$(awk -F: -v uid=\"${host_uid}\" '\$3 == uid {print \$1}' /etc/passwd)
-						if [ -n \"\$existing_user\" ]; then
-							apk add --no-cache shadow >/dev/null 2>&1 || true
-							usermod -l ${target_user} -d /home/${target_user} -m \"\$existing_user\"
-							groupmod -n ${target_user} \"\$existing_user\" 2>/dev/null || true
-						else
-							addgroup -g ${host_gid} ${target_user} 2>/dev/null || true
-							adduser -h /home/${target_user} -D -s /bin/bash -u ${host_uid} -G ${target_user} ${target_user}
-						fi
-					fi
-				"
-				if [[ ${use_sudo} == true ]]; then
-					container_cmd+="
-						apk add --no-cache sudo >/dev/null 2>&1 || true
-						printf '%s\n' '${target_user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/${target_user}
-						chmod 0440 /etc/sudoers.d/${target_user}
-					"
-				fi
-				container_cmd+="
-					exec su - ${target_user}
-				"
-				${docker_cmd} \
-					-w "/home/${target_user}" \
-					-v "${volume_path}:/home/${target_user}" \
-					"${image_type}:${image_version}" \
-					sh -c "${container_cmd}"
-			else
-				container_cmd+="
-					exec bash
-				"
-				${docker_cmd} \
-					-w /root \
-					-v "${volume_path}:/root" \
-					"${image_type}:${image_version}" \
-					sh -c "${container_cmd}"
-			fi
-		else
-			# Persistent
-			if ! docker ps -a --format '{{.Names}}' | grep -qx "${container_name}"; then
-				docker run -d --init --platform "${docker_platform}" --name "${container_name}" \
-					-v "${volume_path}:/root" -v "${volume_path}:/home/${target_user}" \
-					"${image_type}:${image_version}" tail -f /dev/null
-			else
-				docker start "${container_name}" > /dev/null || true
-			fi
-			local persist_setup_script="
-				apk update >/dev/null 2>&1 || true
-				command -v bash >/dev/null 2>&1 || apk add --no-cache bash >/dev/null 2>&1 || true
-			"
-			if [[ -n ${additional_packages} ]]; then
-				persist_setup_script+="
-					apk add --no-cache ${additional_packages} >/dev/null 2>&1 || true
-				"
-			fi
-			if [[ ${use_sudo} == true || ${use_limited} == true ]]; then
-				persist_setup_script+="
-					if id -u ${target_user} >/dev/null 2>&1; then
-						if [ \"\$(id -u ${target_user})\" != \"${host_uid}\" ]; then
-							apk add --no-cache shadow >/dev/null 2>&1 || true
-							usermod -u ${host_uid} ${target_user} 2>/dev/null || true
-						fi
-					else
-						existing_user=\$(awk -F: -v uid=\"${host_uid}\" '\$3 == uid {print \$1}' /etc/passwd)
-						if [ -n \"\$existing_user\" ]; then
-							apk add --no-cache shadow >/dev/null 2>&1 || true
-							usermod -l ${target_user} -d /home/${target_user} -m \"\$existing_user\"
-							groupmod -n ${target_user} \"\$existing_user\" 2>/dev/null || true
-						else
-							addgroup -g ${host_gid} ${target_user} 2>/dev/null || true
-							adduser -h /home/${target_user} -D -s /bin/bash -u ${host_uid} -G ${target_user} ${target_user}
-						fi
-					fi
-					mkdir -p /home/${target_user}
-					chown ${host_uid}:${host_gid} /home/${target_user}
-				"
-				if [[ ${use_sudo} == true ]]; then
-					persist_setup_script+="
-						command -v sudo >/dev/null 2>&1 || apk add --no-cache sudo >/dev/null 2>&1 || true
-						printf '%s\n' '${target_user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/${target_user}
-						chmod 0440 /etc/sudoers.d/${target_user}
-					"
-				fi
-			fi
-			docker exec "${container_name}" sh -c "${persist_setup_script}" || {
-				printf '%b\n' "${unicode_red_circle} Error: Failed to setup persistent container." >&2
-				return 1
-			}
-
-			# Attach via helper
-			if [[ ${use_sudo} == true || ${use_limited} == true ]]; then
-				attach_shell "${target_user}" "/home/${target_user}" true
-			else
-				attach_shell "" /root true
-			fi
-		fi
-	else
-		printf '%b\n' "Error: Unsupported image type '${image_type}'" >&2
-		return 1
+	local pkgs_to_install=""
+	if [[ ${use_sudo} == "true" ]]; then
+		pkgs_to_install="sudo"
 	fi
-	return
+	if [[ -n ${additional_packages} ]]; then
+		pkgs_to_install="${pkgs_to_install:+$pkgs_to_install }${additional_packages}"
+	fi
+
+	# --- Unified Setup Script ---
+	# This script is executed inside the container to set up the environment.
+	read -r -d '' setup_script << EOM || true
+set -e
+export PATH=/usr/sbin:/sbin:\$PATH
+
+# --- Package Installation ---
+if command -v apt-get >/dev/null; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update >/dev/null
+    apt-get install -y --no-install-recommends bash ca-certificates ${pkgs_to_install} >/dev/null
+elif command -v apk >/dev/null; then
+    apk update >/dev/null
+    apk add --no-cache bash shadow ${pkgs_to_install} >/dev/null
+else
+    echo "Unsupported package manager. Cannot install packages." >&2
+    exit 1
+fi
+
+# --- User and Group Setup ---
+if [ "${use_sudo}" = "true" ] || [ "${use_limited}" = "true" ]; then
+    # Create group if it doesn't exist with the specified GID
+    if ! getent group "${host_gid}" >/dev/null; then
+        groupadd -g "${host_gid}" "${target_user}"
+    fi
+
+    # Create user if it doesn't exist with the specified UID
+    if ! id -u "${target_user}" >/dev/null 2>&1; then
+        # Docker bind mounts the volume to the home directory before this runs, so use --no-create-home
+        useradd --shell /bin/bash -u "${host_uid}" -g "${host_gid}" --no-create-home -d "/home/${target_user}" "${target_user}"
+    else
+        # If user exists, ensure UID and GID match the host.
+        usermod -u "${host_uid}" -g "${host_gid}" "${target_user}"
+    fi
+
+    # Grant passwordless sudo rights if requested
+    if [ "${use_sudo}" = "true" ]; then
+        echo "${target_user} ALL=(ALL) NOPASSWD: ALL" > "/etc/sudoers.d/${target_user}"
+        chmod 0440 "/etc/sudoers.d/${target_user}"
+    fi
+
+    # Ensure home directory ownership is correct
+    chown -R "${host_uid}:${host_gid}" "/home/${target_user}"
+fi
+EOM
+
+	# --- Container Execution ---
+	local mount_path
+	local work_dir
+	if [[ ${use_sudo} == true || ${use_limited} == true ]]; then
+		mount_path="/home/${target_user}"
+		work_dir="/home/${target_user}"
+	else
+		mount_path="/root"
+		work_dir="/root"
+	fi
+
+	if [[ ${auto_remove} == true ]]; then # Ephemeral
+		local ephemeral_cmd="${setup_script}"
+		if [[ ${use_sudo} == true || ${use_limited} == true ]]; then
+			ephemeral_cmd+="; exec su -p ${target_user}"
+			docker run "${docker_run_opts[@]}" -w "${work_dir}" -v "${volume_path}:${mount_path}" "${image_type}:${image_version}" sh -c "${ephemeral_cmd}"
+		else
+			ephemeral_cmd+="; exec bash"
+			docker run "${docker_run_opts[@]}" -w "${work_dir}" -v "${volume_path}:${mount_path}" "${image_type}:${image_version}" sh -c "${ephemeral_cmd}"
+		fi
+	else # Persistent
+		if ! docker ps -a --format '{{.Names}}' | grep -qx "${container_name}"; then
+			local persistent_run_opts=(-d --init --security-opt no-new-privileges --platform "${docker_platform}" --name "${container_name}")
+			docker run "${persistent_run_opts[@]}" -w "${work_dir}" -v "${volume_path}:${mount_path}" "${image_type}:${image_version}" tail -f /dev/null
+		else
+			docker start "${container_name}" > /dev/null || true
+		fi
+
+		docker exec "${container_name}" sh -c "${setup_script}" || {
+			trap - EXIT
+			printf '%b\n' "${unicode_red_circle} Error: Failed to setup persistent container." >&2
+			return 1
+		}
+
+		local rc=0
+		if [[ ${use_sudo} == true || ${use_limited} == true ]]; then
+			attach_shell "${target_user}" "${work_dir}" true || rc=$?
+		else
+			attach_shell "" "${work_dir}" true || rc=$?
+		fi
+	fi
+	trap - EXIT
+	return ${rc}
 }
 
-_dh "$@"
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+	_dh "$@"
+fi
