@@ -384,9 +384,12 @@ _dh() {
 	fi
 
 	# Run appropriate Docker container based on image type
-	local docker_run_opts=(-it --security-opt no-new-privileges --platform "${docker_platform}" --name "${container_name}")
+	local docker_run_opts=(-it --platform "${docker_platform}" --name "${container_name}")
 	if [[ ${auto_remove} == true ]]; then
 		docker_run_opts+=(--rm)
+	fi
+	if [[ ${use_sudo} == false ]]; then
+		docker_run_opts+=(--security-opt no-new-privileges)
 	fi
 
 	local pkgs_to_install=""
@@ -465,7 +468,10 @@ EOM
 		fi
 	else # Persistent
 		if ! docker ps -a --format '{{.Names}}' | grep -qx "${container_name}"; then
-			local persistent_run_opts=(-d --init --security-opt no-new-privileges --platform "${docker_platform}" --name "${container_name}")
+			local persistent_run_opts=(-d --init --platform "${docker_platform}" --name "${container_name}")
+			if [[ ${use_sudo} == false ]]; then
+				persistent_run_opts+=(--security-opt no-new-privileges)
+			fi
 			docker run "${persistent_run_opts[@]}" -w "${work_dir}" -v "${volume_path}:${mount_path}" "${image_type}:${image_version}" tail -f /dev/null
 		else
 			docker start "${container_name}" > /dev/null || true
