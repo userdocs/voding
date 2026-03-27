@@ -14,7 +14,7 @@ _dh() {
 		local shell_cmd
 		if [[ ${prefer_bash} == true ]] && docker exec "${container_name}" bash -lc 'command -v bash >/dev/null 2>&1'; then
 			shell_cmd="bash"
-		elif docker exec "${container_name}" sh -lc 'command -v bash >/dev/null 2>&1' > /dev/null 2>&1; then
+		elif docker exec "${container_name}" sh -lc 'command -v bash >/dev/null 2>&1' >/dev/null 2>&1; then
 			shell_cmd="bash"
 		else
 			shell_cmd="sh"
@@ -25,7 +25,7 @@ _dh() {
 			exec_opts+=(-u "${user}")
 		fi
 		local use_workdir=false
-		if [[ -n ${workdir} ]] && docker exec "${container_name}" sh -lc "test -d '${workdir}'" > /dev/null 2>&1; then
+		if [[ -n ${workdir} ]] && docker exec "${container_name}" sh -lc "test -d '${workdir}'" >/dev/null 2>&1; then
 			use_workdir=true
 		fi
 		if [[ ${use_workdir} == true ]]; then
@@ -93,27 +93,27 @@ _dh() {
 	# Default values
 	# Robust platform detection without dpkg (works on most Linux hosts)
 	case "$(uname -m)" in
-		x86_64 | amd64)
-			docker_platform="linux/amd64"
-			;;
-		aarch64 | arm64)
-			docker_platform="linux/arm64"
-			;;
-		armv7l)
-			docker_platform="linux/arm/v7"
-			;;
-		armv6l)
-			docker_platform="linux/arm/v6"
-			;;
-		ppc64le)
-			docker_platform="linux/ppc64le"
-			;;
-		s390x)
-			docker_platform="linux/s390x"
-			;;
-		*)
-			docker_platform="linux/amd64" # sensible default
-			;;
+	x86_64 | amd64)
+		docker_platform="linux/amd64"
+		;;
+	aarch64 | arm64)
+		docker_platform="linux/arm64"
+		;;
+	armv7l)
+		docker_platform="linux/arm/v7"
+		;;
+	armv6l)
+		docker_platform="linux/arm/v6"
+		;;
+	ppc64le)
+		docker_platform="linux/ppc64le"
+		;;
+	s390x)
+		docker_platform="linux/s390x"
+		;;
+	*)
+		docker_platform="linux/amd64" # sensible default
+		;;
 	esac
 	volume_path="$(pwd)"
 
@@ -125,104 +125,104 @@ _dh() {
 			printf '\n%b\n' "${unicode_yellow_circle} ${color_yellow}DEBUG:${color_end} Processing option: ${color_magenta}$opt${color_end}" >&2
 		fi
 		case ${opt} in
-			a)
-				image_type="alpine"
-				image_version="edge"
-				;;
-			u)
-				image_type="ubuntu"
-				image_version="latest"
-				;;
-			d)
-				image_type="debian"
-				image_version="latest"
-				;;
-			D)
-				delete_all=true
-				;;
-			U)
-				target_user="${OPTARG}"
-				;;
-			P)
-				additional_packages="${OPTARG}"
-				;;
-			s)
-				use_sudo=true
-				;;
-			l)
-				use_limited=true
-				;;
-			p)
-				docker_platform="${OPTARG}" # NOSONAR
-				;;
-			i)
-				if [[ ${OPTARG} =~ ^(alpine|ubuntu|debian):(.+)$ ]]; then
-					image_type="${BASH_REMATCH[1]}"
-					image_version="${BASH_REMATCH[2]}"
-				else
-					printf '\n%b\n' "${unicode_red_circle} Error: Invalid image format '${OPTARG}'. Use format: distro:version" >&2
-					printf '\n%b\n\n' "${unicode_yellow_circle} Examples: alpine:latest, ubuntu:22.04, debian:bullseye" >&2
-					return 1
-				fi
-				;;
-			v)
-				if [[ -n ${OPTARG} ]]; then
-					local target_dir # NOSONAR
-					if [[ ${OPTARG} == /* ]]; then
-						target_dir="${OPTARG}"
-					elif [[ ${OPTARG} == ~* ]]; then
-						# Expand leading ~ manually since it's inside quotes
-						target_dir="${OPTARG/#\~/${HOME}}"
-					else
-						target_dir="$(pwd)/${OPTARG}"
-					fi
-					mkdir -p "${target_dir}" || {
-						printf '%b\n' "${unicode_red_circle} Error: Failed to create directory '${target_dir}'" >&2
-						return 1
-					}
-					volume_path="${target_dir}"
-				else
-					printf '%b\n' "Error: -v requires a directory path" >&2
-					return 1
-				fi
-				;;
-			n)
-				force_new=true
-				;;
-			r)
-				auto_remove=true
-				;;
-			q)
-				quiet=true
-				;;
-			h)
-				printf '\n%b\n' "Usage: _dh [OPTIONS]"
-				printf '\n%b\n' "Options:"
-				printf '%b\n' "  -a          Use Alpine Linux (default: edge)"
-				printf '%b\n' "  -u          Use Ubuntu (default: latest)"
-				printf '%b\n' "  -d          Use Debian (default: latest)"
-				printf '%b\n' "  -s          Run with sudo privileges"
-				printf '%b\n' "  -l          Run in limited mode (no sudo)"
-				printf '%b\n' "  -p PLATFORM Set docker platform (default: auto-detect)"
-				printf '%b\n' "  -U USER     Specify username in container (default: gh)"
-				printf '%b\n' '  -P PKGS     Specify extra packages to install (e.g. "curl wget nano")'
-				printf '%b\n' "  -i IMAGE    Specify image:version (e.g., alpine:3.18)"
-				printf '%b\n' "  -v PATH     Create (if needed) and use PATH as volume (absolute, relative, or ~)"
-				printf '%b\n' "  -n          Force create new container (don't reuse existing)"
-				printf '%b\n' "  -r          Auto-remove container on exit (--rm)"
-				printf '%b\n' "  -q          Quiet mode (suppress debug messages)"
-				printf '%b\n\n' "  -D          Delete existing container and its image before starting"
-				printf '%b\n\n' "  -h          Show this help message"
-				return 0
-				;;
-			\?)
-				printf '%b\n' "Error: Invalid option -${OPTARG}. Use -h for help." >&2
+		a)
+			image_type="alpine"
+			image_version="edge"
+			;;
+		u)
+			image_type="ubuntu"
+			image_version="latest"
+			;;
+		d)
+			image_type="debian"
+			image_version="latest"
+			;;
+		D)
+			delete_all=true
+			;;
+		U)
+			target_user="${OPTARG}"
+			;;
+		P)
+			additional_packages="${OPTARG}"
+			;;
+		s)
+			use_sudo=true
+			;;
+		l)
+			use_limited=true
+			;;
+		p)
+			docker_platform="${OPTARG}" # NOSONAR
+			;;
+		i)
+			if [[ ${OPTARG} =~ ^(alpine|ubuntu|debian):(.+)$ ]]; then
+				image_type="${BASH_REMATCH[1]}"
+				image_version="${BASH_REMATCH[2]}"
+			else
+				printf '\n%b\n' "${unicode_red_circle} Error: Invalid image format '${OPTARG}'. Use format: distro:version" >&2
+				printf '\n%b\n\n' "${unicode_yellow_circle} Examples: alpine:latest, ubuntu:22.04, debian:bullseye" >&2
 				return 1
-				;;
-			:)
-				printf '%b\n' "Error: Option -${OPTARG} requires an argument." >&2
+			fi
+			;;
+		v)
+			if [[ -n ${OPTARG} ]]; then
+				local target_dir # NOSONAR
+				if [[ ${OPTARG} == /* ]]; then
+					target_dir="${OPTARG}"
+				elif [[ ${OPTARG} == ~* ]]; then
+					# Expand leading ~ manually since it's inside quotes
+					target_dir="${OPTARG/#\~/${HOME}}"
+				else
+					target_dir="$(pwd)/${OPTARG}"
+				fi
+				mkdir -p "${target_dir}" || {
+					printf '%b\n' "${unicode_red_circle} Error: Failed to create directory '${target_dir}'" >&2
+					return 1
+				}
+				volume_path="${target_dir}"
+			else
+				printf '%b\n' "Error: -v requires a directory path" >&2
 				return 1
-				;;
+			fi
+			;;
+		n)
+			force_new=true
+			;;
+		r)
+			auto_remove=true
+			;;
+		q)
+			quiet=true
+			;;
+		h)
+			printf '\n%b\n' "Usage: _dh [OPTIONS]"
+			printf '\n%b\n' "Options:"
+			printf '%b\n' "  -a          Use Alpine Linux (default: edge)"
+			printf '%b\n' "  -u          Use Ubuntu (default: latest)"
+			printf '%b\n' "  -d          Use Debian (default: latest)"
+			printf '%b\n' "  -s          Run with sudo privileges"
+			printf '%b\n' "  -l          Run in limited mode (no sudo)"
+			printf '%b\n' "  -p PLATFORM Set docker platform (default: auto-detect)"
+			printf '%b\n' "  -U USER     Specify username in container (default: gh)"
+			printf '%b\n' '  -P PKGS     Specify extra packages to install (e.g. "curl wget nano")'
+			printf '%b\n' "  -i IMAGE    Specify image:version (e.g., alpine:3.18)"
+			printf '%b\n' "  -v PATH     Create (if needed) and use PATH as volume (absolute, relative, or ~)"
+			printf '%b\n' "  -n          Force create new container (don't reuse existing)"
+			printf '%b\n' "  -r          Auto-remove container on exit (--rm)"
+			printf '%b\n' "  -q          Quiet mode (suppress debug messages)"
+			printf '%b\n\n' "  -D          Delete existing container and its image before starting"
+			printf '%b\n\n' "  -h          Show this help message"
+			return 0
+			;;
+		\?)
+			printf '%b\n' "Error: Invalid option -${OPTARG}. Use -h for help." >&2
+			return 1
+			;;
+		:)
+			printf '%b\n' "Error: Option -${OPTARG} requires an argument." >&2
+			return 1
+			;;
 		esac
 	done
 
@@ -240,7 +240,7 @@ _dh() {
 	# Security: Validate additional packages to prevent command injection
 	if [[ -n ${additional_packages} ]]; then
 		# Create an array from the space-separated string
-		read -r -a pkg_array <<< "${additional_packages}"
+		read -r -a pkg_array <<<"${additional_packages}"
 		for pkg in "${pkg_array[@]}"; do
 			if [[ ! ${pkg} =~ ^[a-zA-Z0-9][a-zA-Z0-9.+_-]*$ ]]; then
 				printf '%b\n' "${unicode_red_circle} ${color_red}ERROR:${color_end} Invalid package name specified: '${pkg}'" >&2
@@ -265,7 +265,7 @@ _dh() {
 	fi
 
 	# Ensure docker is available (after parsing so -h can exit early)
-	if ! command -v docker > /dev/null 2>&1; then
+	if ! command -v docker >/dev/null 2>&1; then
 		printf '%b\n' "${unicode_red_circle} ${color_red}ERROR:${color_end} Docker is not installed or not in PATH" >&2
 		return 127
 	fi
@@ -279,7 +279,7 @@ _dh() {
 	# Ensure the chosen volume path is writable, otherwise warn.
 	if [[ ! -w ${volume_path} ]]; then
 		local current_user
-		current_user="$(id -un 2> /dev/null || echo 'unknown')"
+		current_user="$(id -un 2>/dev/null || echo 'unknown')"
 		printf '%b\n\n' "${unicode_yellow_circle} ${color_yellow}WARNING:${color_end} Volume path '${volume_path}' is not writable by user '${current_user}'. Container operations may fail."
 	fi
 
@@ -307,21 +307,21 @@ _dh() {
 		printf '%b %s\n' "${unicode_blue_circle}" "Delete requested (-D): removing existing container and image if present." >&2
 		# Remove container if it exists
 		local existing_container
-		existing_container=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
+		existing_container=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2>/dev/null)
 		if [[ -n ${existing_container} ]]; then
 			# Stop if running, then remove
 			local running_container
-			running_container=$(docker ps --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
+			running_container=$(docker ps --filter "name=^/${container_name}$" --format "{{.Names}}" 2>/dev/null)
 			if [[ -n ${running_container} ]]; then
 				printf '%b %s\n' "${unicode_blue_circle}" "Stopping running container '${container_name}'..." >&2
-				docker stop "${container_name}" > /dev/null 2>&1 || true
+				docker stop "${container_name}" >/dev/null 2>&1 || true
 			fi
 			printf '%b %s\n' "${unicode_blue_circle}" "Removing container '${container_name}'..." >&2
-			docker rm -f "${container_name}" > /dev/null 2>&1 || true
+			docker rm -f "${container_name}" >/dev/null 2>&1 || true
 		fi
 		# Attempt to remove image by tag; ignore errors if not present or in use
 		printf '%b %s\n\n' "${unicode_blue_circle}" "Removing image '${image_type}:${image_version}' (if present)..." >&2
-		docker rmi -f "${image_type}:${image_version}" > /dev/null 2>&1 || true
+		docker rmi -f "${image_type}:${image_version}" >/dev/null 2>&1 || true
 		# Ensure we create a fresh container
 		force_new=true
 	fi
@@ -329,18 +329,18 @@ _dh() {
 	# Check if container already exists and is not being forced to create new
 	if [[ ${force_new} == false ]]; then
 		local existing_container
-		existing_container=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
+		existing_container=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2>/dev/null)
 
 		if [[ -n ${existing_container} ]]; then
 			printf '%b %s\n' "${unicode_green_circle}" "Reusing existing container: ${existing_container}" >&2
 
 			# Check if container is running
 			local running_container
-			running_container=$(docker ps --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
+			running_container=$(docker ps --filter "name=^/${container_name}$" --format "{{.Names}}" 2>/dev/null)
 
 			if [[ -z ${running_container} ]]; then
 				printf '%b %s\n' "${unicode_blue_circle}" "Starting stopped container..." >&2
-				docker start "${container_name}" > /dev/null || true
+				docker start "${container_name}" >/dev/null || true
 			fi
 
 			# If still exists and running, attach; otherwise fall through to creation
@@ -350,7 +350,7 @@ _dh() {
 				# Try to detect user and workdir
 				if [[ -n ${existing_container} ]]; then
 					local rc=0
-					if docker exec "${container_name}" id "${target_user}" > /dev/null 2>&1; then
+					if docker exec "${container_name}" id "${target_user}" >/dev/null 2>&1; then
 						attach_shell "${target_user}" "/home/${target_user}" true || rc=$?
 					else
 						attach_shell "" /root true || rc=$?
@@ -363,24 +363,29 @@ _dh() {
 	else
 		# Force new container - remove existing one if it exists
 		local existing_container
-		existing_container=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
+		existing_container=$(docker ps -a --filter "name=^/${container_name}$" --format "{{.Names}}" 2>/dev/null)
 
 		if [[ -n ${existing_container} ]]; then
 			printf '%b %s\n' "${unicode_yellow_circle}" "Force new container requested - removing existing container: ${existing_container}" >&2
 
 			# Stop container if it's running
 			local running_container
-			running_container=$(docker ps --filter "name=^/${container_name}$" --format "{{.Names}}" 2> /dev/null)
+			running_container=$(docker ps --filter "name=^/${container_name}$" --format "{{.Names}}" 2>/dev/null)
 			if [[ -n ${running_container} ]]; then
 				printf '%b %s\n' "${unicode_blue_circle}" "Stopping running container..." >&2
-				docker stop "${container_name}" > /dev/null
+				docker stop "${container_name}" >/dev/null
 			fi
 
 			# Remove the container
 			printf '%b %s\n' "${unicode_blue_circle}" "Removing existing container..." >&2
-			docker rm -f "${container_name}" > /dev/null 2>&1 || true
+			docker rm -f "${container_name}" >/dev/null 2>&1 || true
 			printf '%b %s\n\n' "${unicode_green_circle}" "Container removed successfully" >&2
 		fi
+	fi
+
+	local env_opts=(-e "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	if [[ ${image_type} == "ubuntu" || ${image_type} == "debian" ]]; then
+		env_opts+=(-e "LANG=C.UTF-8" -e "LANGUAGE=C.UTF-8" -e "LC_ALL=C.UTF-8" -e "DEBIAN_FRONTEND=noninteractive" -e "DEBCONF_NOWARNINGS=yes")
 	fi
 
 	# Run appropriate Docker container based on image type
@@ -391,6 +396,7 @@ _dh() {
 	if [[ ${use_sudo} == false ]]; then
 		docker_run_opts+=(--security-opt no-new-privileges)
 	fi
+	docker_run_opts+=("${env_opts[@]}")
 
 	local pkgs_to_install=""
 	if [[ ${use_sudo} == "true" ]]; then
@@ -402,18 +408,25 @@ _dh() {
 
 	# --- Unified Setup Script ---
 	# This script is executed inside the container to set up the environment.
-	read -r -d '' setup_script << EOM || true
+	read -r -d '' setup_script <<EOM || true
 set -e
-export PATH=/usr/sbin:/sbin:\$PATH
 
 # --- Package Installation ---
-if command -v apt-get >/dev/null; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update >/dev/null
-    apt-get install -y --no-install-recommends bash ca-certificates ${pkgs_to_install} >/dev/null
-elif command -v apk >/dev/null; then
-    apk update >/dev/null
-    apk add --no-cache bash shadow ${pkgs_to_install} >/dev/null
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -qq -y --no-install-recommends bash ca-certificates ${pkgs_to_install} >/dev/null 2>&1
+    # Disable the 'command-not-found' handler that prints a sudo hint. This is often mistaken
+    # for sudo's own lecture, but it's a separate system. Disabling it provides a cleaner shell.
+    if [ -f /etc/bash.bashrc ]; then
+        if [ -x /usr/lib/command-not-found ]; then
+            chmod -x /usr/lib/command-not-found
+        elif [ -x /usr/share/command-not-found/command-not-found ]; then
+            chmod -x /usr/share/command-not-found/command-not-found
+        fi
+    fi
+elif command -v apk >/dev/null 2>&1; then
+    apk update -q >/dev/null 2>&1
+    apk add -q --no-cache bash shadow ${pkgs_to_install} >/dev/null 2>&1
 else
     echo "Unsupported package manager. Cannot install packages." >&2
     exit 1
@@ -422,27 +435,46 @@ fi
 # --- User and Group Setup ---
 if [ "${use_sudo}" = "true" ] || [ "${use_limited}" = "true" ]; then
     # Create group if it doesn't exist with the specified GID
-    if ! getent group "${host_gid}" >/dev/null; then
-        groupadd -g "${host_gid}" "${target_user}"
+    if ! getent group "${host_gid}" >/dev/null 2>&1; then
+        groupadd -g "${host_gid}" "${target_user}" >/dev/null 2>&1
     fi
 
     # Create user if it doesn't exist with the specified UID
     if ! id -u "${target_user}" >/dev/null 2>&1; then
         # Docker bind mounts the volume to the home directory before this runs, so use --no-create-home
-        useradd --shell /bin/bash -u "${host_uid}" -g "${host_gid}" --no-create-home -d "/home/${target_user}" "${target_user}"
+        useradd -o --shell /bin/bash -u "${host_uid}" -g "${host_gid}" --no-create-home -d "/home/${target_user}" "${target_user}" >/dev/null 2>&1
     else
         # If user exists, ensure UID and GID match the host.
-        usermod -u "${host_uid}" -g "${host_gid}" "${target_user}"
+        usermod -o -u "${host_uid}" -g "${host_gid}" "${target_user}" >/dev/null 2>&1
     fi
 
     # Grant passwordless sudo rights if requested
     if [ "${use_sudo}" = "true" ]; then
-        echo "${target_user} ALL=(ALL) NOPASSWD: ALL" > "/etc/sudoers.d/${target_user}"
+        mkdir -p /etc/sudoers.d
+        echo "${target_user} ALL=(ALL:ALL) NOPASSWD: ALL" > "/etc/sudoers.d/${target_user}"
         chmod 0440 "/etc/sudoers.d/${target_user}"
+
+        # Append to /etc/sudoers to guarantee precedence and handle missing includedir
+        echo "" >> /etc/sudoers
+        echo "Defaults lecture=never" >> /etc/sudoers
+        echo "${target_user} ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+		# Also add user to the appropriate sudo/wheel group for robustness.
+		if getent group sudo >/dev/null 2>&1; then
+			usermod -aG sudo "${target_user}" >/dev/null 2>&1
+			echo "%sudo ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
+		elif getent group wheel >/dev/null 2>&1; then
+			# For Alpine/CentOS
+			usermod -aG wheel "${target_user}" >/dev/null 2>&1
+			echo "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
+		fi
+		
+		# Suppress Ubuntu's default "To run a command as administrator" hint
+		touch "/home/${target_user}/.sudo_as_admin_successful" >/dev/null 2>&1
     fi
 
     # Ensure home directory ownership is correct
-    chown -R "${host_uid}:${host_gid}" "/home/${target_user}"
+    chown -R "${host_uid}:${host_gid}" "/home/${target_user}" >/dev/null 2>&1
 fi
 EOM
 
@@ -472,9 +504,10 @@ EOM
 			if [[ ${use_sudo} == false ]]; then
 				persistent_run_opts+=(--security-opt no-new-privileges)
 			fi
+			persistent_run_opts+=("${env_opts[@]}")
 			docker run "${persistent_run_opts[@]}" -w "${work_dir}" -v "${volume_path}:${mount_path}" "${image_type}:${image_version}" tail -f /dev/null
 		else
-			docker start "${container_name}" > /dev/null || true
+			docker start "${container_name}" >/dev/null || true
 		fi
 
 		docker exec "${container_name}" sh -c "${setup_script}" || {
