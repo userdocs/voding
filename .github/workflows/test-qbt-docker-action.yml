@@ -65,11 +65,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
+      - name: Setup action output files
+        run: |
+          : > /tmp/act_gh_env
+          : > /tmp/act_gh_output
+          : > /tmp/act_gh_summary
+          echo "ACT_GH_ENV=/tmp/act_gh_env"         >> "$GITHUB_ENV"
+          echo "ACT_GH_OUTPUT=/tmp/act_gh_output"   >> "$GITHUB_ENV"
+          echo "ACT_GH_SUMMARY=/tmp/act_gh_summary" >> "$GITHUB_ENV"
+
       - name: Run action (non-root, no extra packages)
         env:
-          GITHUB_ENV: ${{ runner.temp }}/gh_env
-          GITHUB_OUTPUT: ${{ runner.temp }}/gh_output
-          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gh_summary
+          GITHUB_ENV: /tmp/act_gh_env
+          GITHUB_OUTPUT: /tmp/act_gh_output
+          GITHUB_STEP_SUMMARY: /tmp/act_gh_summary
           GITHUB_WORKSPACE: ${{ github.workspace }}
           RUNNER_ARCH: X64
           inputs_os_id: ${{ matrix.os_id }}
@@ -80,20 +89,16 @@ jobs:
           inputs_platform: ""
           inputs_dockerfile: ""
           inputs_custom_docker_commands: ""
-        run: |
-          : > "$GITHUB_ENV"
-          : > "$GITHUB_OUTPUT"
-          : > "$GITHUB_STEP_SUMMARY"
-          bash actions/qbt_docker/action.bash
+        run: bash actions/qbt_docker/action.bash
 
       - name: Verify container is running
         run: docker ps --filter name=qbt_builder --format '{{.Names}}' | grep -q qbt_builder
 
       - name: Verify container outputs
         run: |
-          grep -q "container_name=qbt_builder" "${{ runner.temp }}/gh_output"
-          grep -q "wd=/home/gh"               "${{ runner.temp }}/gh_output"
-          grep -q "uid=1001"                  "${{ runner.temp }}/gh_output"
+          grep -q "container_name=qbt_builder" /tmp/act_gh_output
+          grep -q "wd=/home/gh"               /tmp/act_gh_output
+          grep -q "uid=1001"                  /tmp/act_gh_output
 
       - name: Run a command in the container
         run: docker exec qbt_builder bash -c 'id && pwd'
@@ -102,11 +107,17 @@ jobs:
         if: always()
         run: docker rm -f qbt_builder 2>/dev/null || true
 
+      - name: Reset output files for second run
+        run: |
+          : > /tmp/act_gh_env
+          : > /tmp/act_gh_output
+          : > /tmp/act_gh_summary
+
       - name: Run action (with additional packages)
         env:
-          GITHUB_ENV: ${{ runner.temp }}/gh_env2
-          GITHUB_OUTPUT: ${{ runner.temp }}/gh_output2
-          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gh_summary2
+          GITHUB_ENV: /tmp/act_gh_env
+          GITHUB_OUTPUT: /tmp/act_gh_output
+          GITHUB_STEP_SUMMARY: /tmp/act_gh_summary
           GITHUB_WORKSPACE: ${{ github.workspace }}
           RUNNER_ARCH: X64
           inputs_os_id: ${{ matrix.os_id }}
@@ -117,11 +128,7 @@ jobs:
           inputs_platform: ""
           inputs_dockerfile: ""
           inputs_custom_docker_commands: ""
-        run: |
-          : > "$GITHUB_ENV"
-          : > "$GITHUB_OUTPUT"
-          : > "$GITHUB_STEP_SUMMARY"
-          bash actions/qbt_docker/action.bash
+        run: bash actions/qbt_docker/action.bash
 
       - name: Verify curl is installed in container
         run: docker exec qbt_builder curl --version
@@ -138,19 +145,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - name: Create test Dockerfile
+      - name: Setup action output files
         run: |
-          cat > /tmp/test.Dockerfile << 'EOF'
-          FROM alpine:edge
-          WORKDIR /workspace
-          RUN apk add --no-cache curl
-          EOF
+          : > /tmp/act_gh_env
+          : > /tmp/act_gh_output
+          : > /tmp/act_gh_summary
+
+      - name: Create test Dockerfile in workspace
+        run: |
+          printf 'FROM alpine:edge\nWORKDIR /workspace\nRUN apk add --no-cache curl\n' \
+            > "$GITHUB_WORKSPACE/test.Dockerfile"
 
       - name: Run action with custom Dockerfile
         env:
-          GITHUB_ENV: ${{ runner.temp }}/gh_env
-          GITHUB_OUTPUT: ${{ runner.temp }}/gh_output
-          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/gh_summary
+          GITHUB_ENV: /tmp/act_gh_env
+          GITHUB_OUTPUT: /tmp/act_gh_output
+          GITHUB_STEP_SUMMARY: /tmp/act_gh_summary
           GITHUB_WORKSPACE: ${{ github.workspace }}
           RUNNER_ARCH: X64
           inputs_os_id: alpine
@@ -161,15 +171,10 @@ jobs:
           inputs_platform: linux/amd64
           inputs_dockerfile: test.Dockerfile
           inputs_custom_docker_commands: ""
-        run: |
-          cp /tmp/test.Dockerfile "$GITHUB_WORKSPACE/test.Dockerfile"
-          : > "$GITHUB_ENV"
-          : > "$GITHUB_OUTPUT"
-          : > "$GITHUB_STEP_SUMMARY"
-          bash actions/qbt_docker/action.bash
+        run: bash actions/qbt_docker/action.bash
 
       - name: Verify WORKDIR extracted from Dockerfile
-        run: grep -q "wd=/workspace" "${{ runner.temp }}/gh_output"
+        run: grep -q "wd=/workspace" /tmp/act_gh_output
 
       - name: Verify curl available in custom container
         run: docker exec qbt_builder curl --version
