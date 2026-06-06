@@ -464,6 +464,7 @@ run_test "command substitution in docker command value exits 1" 1 \
 reset_docker_log
 # shellcheck disable=SC2016
 invoke_script inputs_custom_docker_commands='--volume $wd:/host'
+# shellcheck disable=SC2016
 assert_docker '$wd expanded to /home/gh in volume arg' "/home/gh:/host"
 
 #─────────────────────────────────────────────────────
