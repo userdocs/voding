@@ -34,12 +34,14 @@ inputs_os_version_id="${inputs_os_version_id:=edge}"
 inputs_custom_docker_commands="${inputs_custom_docker_commands:-}"
 inputs_additional_apps="${inputs_additional_apps:-}"
 inputs_platform="${inputs_platform:-}"
-workspace=${GITHUB_WORKSPACE}
+# Runner architecture is provided by GitHub Actions as an external env var.
+# shellcheck disable=SC2153
 runner_arch=${RUNNER_ARCH}
 
 # These variables are immutable and cannot be changed by injection or used to run subshell commands.
 readonly container_name="qbt_builder"
-readonly wd="/home/gh"
+# wd is not readonly: the fast-path may override it from a Dockerfile WORKDIR instruction.
+wd="/home/gh"
 readonly non_root_user="gh"
 readonly non_root_uid="1001"
 readonly non_root_gid="1001"
@@ -49,6 +51,7 @@ readonly workspace="${GITHUB_WORKSPACE:-$PWD}"
 declare -a docker_command=()
 declare -a clean_envs=()
 declare -a inputs_additional_apps_array=()
+declare -a inputs_custom_docker_commands_array=()
 declare dockerfile_path=""
 declare custom_image_tag=""
 declare env_custom=""
@@ -118,8 +121,9 @@ validate_input() {
 			esac
 			;;
 		"env_var")
-			# Validate environment variable format and block dangerous ones
-			if [[ ! $input =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || [[ $input =~ ^(PATH|LD_|BASH_|SHELL|HOME)= ]]; then
+			# Validate environment variable format and block dangerous ones.
+			# LD_ and BASH_ are prefix-matched to catch LD_PRELOAD, BASH_ENV, etc.
+			if [[ ! $input =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || [[ $input =~ ^(PATH|SHELL|HOME)= ]] || [[ $input =~ ^(LD_|BASH_) ]]; then
 				log_error "Security: Invalid environment variable blocked: $input"
 				exit 1
 			fi
@@ -179,11 +183,6 @@ validate_basic_inputs() {
 
 	# Validate platform input for security
 	validate_input "$inputs_platform" "platform"
-
-	# Validate package names for security
-	for pkg in "${inputs_additional_apps_array[@]}"; do
-		[[ -n $pkg ]] && validate_input "$pkg" "package_name"
-	done
 }
 
 #=============================================================================
@@ -482,7 +481,7 @@ sanitize_env_file() {
 			[[ -z $line || $line =~ ^[[:space:]]*# ]] && continue
 			# Use centralized validation
 			if validate_input "$line" "env_var" 2> /dev/null; then
-				echo "$line"
+				printf '%s\n' "$line"
 			else
 				log_error "Security: Invalid environment variable blocked: $line"
 			fi
@@ -557,6 +556,11 @@ parse_docker_commands() {
 	# Parse inputs
 	parse_app_list "$inputs_additional_apps" inputs_additional_apps_array
 
+	# Validate package names now that the array is populated
+	for pkg in "${inputs_additional_apps_array[@]}"; do
+		[[ -n $pkg ]] && validate_input "$pkg" "package_name"
+	done
+
 	# $INPUT_SETTING contains newline-separated items
 	# Read lines (preserve empty lines for filtering) and strip CRs
 	mapfile -t inputs_custom_docker_commands_array <<< "$(printf '%s' "$inputs_custom_docker_commands" | tr -d '\r')"
@@ -630,6 +634,7 @@ parse_docker_commands() {
 # Generate Dockerfile for userdocs images
 generate_userdocs_dockerfile() {
 	local detected_os="$1"
+	local -a df_lines
 
 	case "$detected_os" in
 		"debian" | "ubuntu")
@@ -677,6 +682,7 @@ generate_userdocs_dockerfile() {
 generate_standard_dockerfile() {
 	local detected_os="$1"
 	local backslash=$'\\'
+	local -a df_lines
 
 	case "$detected_os" in
 		"alpine")
@@ -848,205 +854,208 @@ to_gh_output() {
 # MAIN EXECUTION FLOW
 #=============================================================================
 
-# Setup platform detection and configuration first (sets defaults)
-setup_platform
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 
-# Input validation after platform setup
-validate_basic_inputs
+	# Setup platform detection and configuration first (sets defaults)
+	setup_platform
 
-# Process environment configuration
-process_environment
+	# Input validation after platform setup
+	validate_basic_inputs
 
-# Parse and validate inputs
-parse_docker_commands
+	# Process environment configuration
+	process_environment
 
-###
-### Fast-path: if the user supplied a Dockerfile, ignore other inputs except env related
-###
+	# Parse and validate inputs
+	parse_docker_commands
 
-if [[ -n $inputs_dockerfile ]]; then
-	dockerfile_path="${workspace}/${container_name}_dockerfile"
-	log_info "Fast-path: using provided Dockerfile: $inputs_dockerfile"
+	###
+	### Fast-path: if the user supplied a Dockerfile, ignore other inputs except env related
+	###
 
-	case "$inputs_dockerfile" in
-		http://* | https://*)
-			log_error "Security: Remote Dockerfiles not allowed for security reasons"
-			exit 1
-			;;
-		*)
-			validate_input "$inputs_dockerfile" "dockerfile_path"
-			if [[ -f "$workspace/$inputs_dockerfile" ]]; then
-				cp "$workspace/$inputs_dockerfile" "$dockerfile_path" || {
-					log_error "Failed to copy Dockerfile from $workspace/$inputs_dockerfile to $dockerfile_path"
-					exit 1
-				}
-			else
-				log_error "Dockerfile not found at '$workspace/$inputs_dockerfile'"
+	if [[ -n $inputs_dockerfile ]]; then
+		dockerfile_path="${workspace}/${container_name}_dockerfile"
+		log_info "Fast-path: using provided Dockerfile: $inputs_dockerfile"
+
+		case "$inputs_dockerfile" in
+			http://* | https://*)
+				log_error "Security: Remote Dockerfiles not allowed for security reasons"
 				exit 1
-			fi
-			;;
-	esac
+				;;
+			*)
+				validate_input "$inputs_dockerfile" "dockerfile_path"
+				if [[ -f "$workspace/$inputs_dockerfile" ]]; then
+					cp "$workspace/$inputs_dockerfile" "$dockerfile_path" || {
+						log_error "Failed to copy Dockerfile from $workspace/$inputs_dockerfile to $dockerfile_path"
+						exit 1
+					}
+				else
+					log_error "Dockerfile not found at '$workspace/$inputs_dockerfile'"
+					exit 1
+				fi
+				;;
+		esac
 
-	if [[ ! -s $dockerfile_path ]]; then
-		log_error "Dockerfile is empty or missing after fetch: $dockerfile_path"
-		exit 1
+		if [[ ! -s $dockerfile_path ]]; then
+			log_error "Dockerfile is empty or missing after fetch: $dockerfile_path"
+			exit 1
+		fi
+
+		# Write Dockerfile to the step summary for visibility
+		log_info "Using Dockerfile: $dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
+		{
+			printf '%b\n' "\`\`\`bash\n"
+			cat "$dockerfile_path"
+			printf '%b\n' '```'
+		} | tee -a "$GITHUB_STEP_SUMMARY"
+
+		# Build with a simple predictable tag
+		custom_image_tag="custom_dockerfile"
+
+		log_info "Building image from provided Dockerfile as: $custom_image_tag for platform: $inputs_platform"
+		docker build --platform "$inputs_platform" -f "$dockerfile_path" -t "$custom_image_tag" . || {
+			log_error "Failed to build Docker image from provided Dockerfile"
+			# Clean up Dockerfile if left behind
+			rm -f "$dockerfile_path"
+			exit 1
+		}
+
+		docker_command+=("$custom_image_tag")
+
+		# Start a container (detached) from the built image so it's running like a daemon.
+		log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
+		docker run -it -d --platform "$inputs_platform" --name "${container_name}" "${clean_envs[@]}" "${docker_command[@]}" || {
+			log_error "Failed to start container from image $custom_image_tag"
+			rm -f "$dockerfile_path"
+			exit 1
+		}
+
+		# if the dockerfile has a WORKDIR set grab the path and set it to wd or we have no idea what it is.
+		# Use safe parsing to prevent command injection
+		extracted_wd=$(grep -E '^[[:space:]]*WORKDIR[[:space:]]+' "$dockerfile_path" | tail -1 | sed -E 's/^[[:space:]]*WORKDIR[[:space:]]+//' || echo "")
+		if [[ -n $extracted_wd ]]; then
+			# Validate extracted workdir for security
+			if [[ $extracted_wd =~ ^[a-zA-Z0-9/_.-]+$ ]] && [[ ${#extracted_wd} -le 256 ]]; then
+				wd="$extracted_wd"
+			else
+				# Log warning about invalid WORKDIR (but continue with default)
+				printf '[%s] [WARN] Security: Invalid WORKDIR path found in Dockerfile, using default: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$extracted_wd" >&2
+			fi
+		fi
+
+		# Clean up the temporary Dockerfile and emit minimal outputs
+		rm -f "$dockerfile_path"
+
+		log_debug "custom_image_tag=$custom_image_tag"
+
+		_inputs_info | tee -a "$GITHUB_STEP_SUMMARY"
+		_env_info
+
+		exit 0
 	fi
 
-	# Write Dockerfile to the step summary for visibility
-	log_info "Using Dockerfile: $dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
+	###
+	### Fast-path: ends Here
+	###
+
+	# Configure Docker security and runtime options
+	if [[ $inputs_use_root == "false" ]]; then
+		docker_command+=("-u" "${non_root_uid}:${non_root_gid}")
+	fi
+
+	# Security hardening: Add Docker security options.
+	# --platform is passed explicitly in the docker run call; do not duplicate it here.
+	docker_command+=(
+		"--cap-drop" "ALL"
+		"--cap-add" "CHOWN"
+		"--cap-add" "DAC_OVERRIDE"
+		"--cap-add" "FOWNER"
+		"--cap-add" "SETUID"
+		"--cap-add" "SETGID"
+	)
+
+	docker_command+=("-w" "$wd")
+	docker_command+=("-v" "$workspace:$wd")
+
+	# Always create a custom Dockerfile to ensure packages are updated and upgraded
+	# Check for additional packages
+	if [[ ${#inputs_additional_apps_array[@]} -gt 0 && -n ${inputs_additional_apps_array[0]} ]]; then
+		log_debug "Additional packages requested: ${#inputs_additional_apps_array[@]} packages"
+	fi
+
+	# Check if we have custom docker commands that require special handling
+	# Most custom docker commands are runtime arguments and don't need dockerfile modification
+	if [[ ${#clean_envs[@]} -gt 0 ]]; then
+		log_debug "Custom Docker commands will be applied at container runtime: ${#clean_envs[@]} arguments"
+	fi
+
+	# Always create dockerfile for updates/upgrades and potential user setup
+	if [[ ! $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
+		log_debug "Non-userdocs image requires user setup and updates"
+	else
+		log_debug "Userdocs image - applying updates and upgrades"
+	fi
+
+	# Create Dockerfile for package installation
+	dockerfile_path="${workspace}/${container_name}_dockerfile"
+	custom_image_tag="${container_name}"
+
+	# Detect OS type for any image using centralized function
+	detected_os=$(detect_image_os "${inputs_os_id}:${inputs_os_version_id}")
+	log_info "Detected OS type: $detected_os for image: ${inputs_os_id}:${inputs_os_version_id}"
+
+	# Generate Dockerfile based on image type and detected OS
+	if [[ $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
+		log_info "Creating userdocs Dockerfile for updates and additional packages"
+	else
+		case "$detected_os" in
+			"alpine")
+				log_info "Creating Alpine Linux Dockerfile with updates"
+				;;
+			"debian" | "ubuntu")
+				log_info "Creating Debian/Ubuntu Dockerfile with updates"
+				;;
+			*)
+				log_info "Creating fallback Dockerfile with updates for unknown OS: $inputs_os_id"
+				;;
+		esac
+	fi
+
+	printf '%b\n' "\`\`\`bash\n" >> "$GITHUB_STEP_SUMMARY"
 	{
-		printf '%b\n' "\`\`\`bash\n"
-		cat "$dockerfile_path"
-		printf '%b\n' '```'
-	} | tee -a "$GITHUB_STEP_SUMMARY"
+		if [[ $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
+			# Special handling for userdocs images - they already have user setup
+			generate_userdocs_dockerfile "$detected_os"
+		else
+			# Standard images - need full user setup
+			generate_standard_dockerfile "$detected_os"
+		fi
+	} | tee "$dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
+	printf '%b\n' '```' >> "$GITHUB_STEP_SUMMARY"
 
-	# Build with a simple predictable tag
-	custom_image_tag="custom_dockerfile"
+	# Build the custom image
+	log_info "Building container image with additional packages for platform: $inputs_platform"
+	log_info "Using base image: ${inputs_os_id}:${inputs_os_version_id}"
 
-	log_info "Building image from provided Dockerfile as: $custom_image_tag for platform: $inputs_platform"
 	docker build --platform "$inputs_platform" -f "$dockerfile_path" -t "$custom_image_tag" . || {
-		log_error "Failed to build Docker image from provided Dockerfile"
-		# Clean up Dockerfile if left behind
-		rm -f "$dockerfile_path"
+		log_error "Failed to build Docker image for platform $inputs_platform"
+		log_error "Base image: ${inputs_os_id}:${inputs_os_version_id}"
+
+		log_error "Failed to build for platform $inputs_platform"
+		log_error "This could be due to: unsupported platform, missing emulation, or registry issues"
 		exit 1
 	}
+
+	# Clean up the Dockerfile
+	rm -f "$dockerfile_path"
 
 	docker_command+=("$custom_image_tag")
 
-	# Start a container (detached) from the built image so it's running like a daemon.
-	log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
 	docker run -it -d --platform "$inputs_platform" --name "${container_name}" "${clean_envs[@]}" "${docker_command[@]}" || {
-		log_error "Failed to start container from image $custom_image_tag"
-		rm -f "$dockerfile_path"
+		log_error "Failed to create Docker container with command: ${docker_command[*]}"
 		exit 1
 	}
-
-	# if the dockerfile has a WORKDIR set grab the path and set it to wd or we have no idea what it is.
-	# Use safe parsing to prevent command injection
-	extracted_wd
-	extracted_wd=$(grep -E '^[[:space:]]*WORKDIR[[:space:]]+' "$dockerfile_path" | tail -1 | sed -E 's/^[[:space:]]*WORKDIR[[:space:]]+//' || echo "")
-	if [[ -n $extracted_wd ]]; then
-		# Validate extracted workdir for security
-		if [[ $extracted_wd =~ ^[a-zA-Z0-9/_.-]+$ ]] && [[ ${#extracted_wd} -le 256 ]]; then
-			wd="$extracted_wd"
-		else
-			# Log warning about invalid WORKDIR (but continue with default)
-			printf '[%s] [WARN] Security: Invalid WORKDIR path found in Dockerfile, using default: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$extracted_wd" >&2
-		fi
-	fi
-
-	# Clean up the temporary Dockerfile and emit minimal outputs
-	rm -f "$dockerfile_path"
-
-	log_debug "custom_image_tag=$custom_image_tag"
 
 	_inputs_info | tee -a "$GITHUB_STEP_SUMMARY"
 	_env_info
 
-	exit 0
-fi
-
-###
-### Fast-path: ends Here
-###
-
-# Configure Docker security and runtime options
-if [[ $inputs_use_root == "false" ]]; then
-	docker_command+=("-u" "${non_root_uid}:${non_root_gid}")
-fi
-
-# Security hardening: Add Docker security options
-docker_command+=(
-	"--platform" "$inputs_platform"
-	"--cap-drop" "ALL"
-	"--cap-add" "CHOWN"
-	"--cap-add" "DAC_OVERRIDE"
-	"--cap-add" "FOWNER"
-	"--cap-add" "SETUID"
-	"--cap-add" "SETGID"
-)
-
-docker_command+=("-w" "$wd")
-docker_command+=("-v" "$workspace:$wd")
-
-# Always create a custom Dockerfile to ensure packages are updated and upgraded
-# Check for additional packages
-if [[ ${#inputs_additional_apps_array[@]} -gt 0 && -n ${inputs_additional_apps_array[0]} ]]; then
-	log_debug "Additional packages requested: ${#inputs_additional_apps_array[@]} packages"
-fi
-
-# Check if we have custom docker commands that require special handling
-# Most custom docker commands are runtime arguments and don't need dockerfile modification
-if [[ ${#clean_envs[@]} -gt 0 ]]; then
-	log_debug "Custom Docker commands will be applied at container runtime: ${#clean_envs[@]} arguments"
-fi
-
-# Always create dockerfile for updates/upgrades and potential user setup
-if [[ ! $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
-	log_debug "Non-userdocs image requires user setup and updates"
-else
-	log_debug "Userdocs image - applying updates and upgrades"
-fi
-
-# Create Dockerfile for package installation
-dockerfile_path="${workspace}/${container_name}_dockerfile"
-custom_image_tag="${container_name}"
-
-# Detect OS type for any image using centralized function
-detected_os=$(detect_image_os "${inputs_os_id}:${inputs_os_version_id}")
-log_info "Detected OS type: $detected_os for image: ${inputs_os_id}:${inputs_os_version_id}"
-
-# Generate Dockerfile based on image type and detected OS
-if [[ $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
-	log_info "Creating userdocs Dockerfile for updates and additional packages"
-else
-	case "$detected_os" in
-		"alpine")
-			log_info "Creating Alpine Linux Dockerfile with updates"
-			;;
-		"debian" | "ubuntu")
-			log_info "Creating Debian/Ubuntu Dockerfile with updates"
-			;;
-		*)
-			log_info "Creating fallback Dockerfile with updates for unknown OS: $inputs_os_id"
-			;;
-	esac
-fi
-
-printf '%b\n' "\`\`\`bash\n" >> "$GITHUB_STEP_SUMMARY"
-{
-	if [[ $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
-		# Special handling for userdocs images - they already have user setup
-		generate_userdocs_dockerfile "$detected_os"
-	else
-		# Standard images - need full user setup
-		generate_standard_dockerfile "$detected_os"
-	fi
-} | tee "$dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
-printf '%b\n' '```' >> "$GITHUB_STEP_SUMMARY"
-
-# Build the custom image
-log_info "Building container image with additional packages for platform: $inputs_platform"
-log_info "Using base image: ${inputs_os_id}:${inputs_os_version_id}"
-
-docker build --platform "$inputs_platform" -f "$dockerfile_path" -t "$custom_image_tag" . || {
-	log_error "Failed to build Docker image for platform $inputs_platform"
-	log_error "Base image: ${inputs_os_id}:${inputs_os_version_id}"
-
-	log_error "Failed to build for platform $inputs_platform"
-	log_error "This could be due to: unsupported platform, missing emulation, or registry issues"
-	exit 1
-}
-
-# Clean up the Dockerfile
-rm -f "$dockerfile_path"
-
-docker_command+=("$custom_image_tag")
-
-docker run -it -d --platform "$inputs_platform" --name "${container_name}" "${clean_envs[@]}" "${docker_command[@]}" || {
-	log_error "Failed to create Docker container with command: ${docker_command[*]}"
-	exit 1
-}
-
-_inputs_info | tee -a "$GITHUB_STEP_SUMMARY"
-_env_info
+fi # end sourcing guard
