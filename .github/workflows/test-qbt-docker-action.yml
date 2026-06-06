@@ -174,7 +174,10 @@ jobs:
         run: bash actions/qbt_docker/action.bash
 
       - name: Verify WORKDIR extracted from Dockerfile
-        run: grep -q "wd=/workspace" /tmp/act_gh_output
+        # The runner picks up wd=/workspace from GITHUB_ENV after the action step
+        # and injects it as an env var; verify it here rather than grepping the
+        # output file which the runner may have already processed.
+        run: test "$wd" = "/workspace"
 
       - name: Verify curl available in custom container
         run: docker exec qbt_builder curl --version
