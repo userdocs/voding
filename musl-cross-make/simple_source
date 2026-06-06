@@ -112,7 +112,7 @@ test_mirror_speed() {
 
 	# Convert bytes/sec to KB/s and round to integer
 	local speed_kb
-	speed_kb=$(printf '%.0f' "${speed_result%.*}")
+	speed_kb=$(printf '%.0f' "$speed_result")
 	print_msg "DEBUG" "Speed test result: ${speed_kb} KB/s"
 	printf '%s' "$speed_kb"
 }
@@ -154,8 +154,10 @@ if [[ ${#args[@]} -gt 0 ]]; then
 		fi
 		preferred_mirror="${args[0]%/}"
 	else
-		if ! versions; then
-			case $? in
+		versions
+		versions_rc=$?
+		if [[ $versions_rc -ne 0 ]]; then
+			case $versions_rc in
 				2) exit 2 ;;
 				*) exit 1 ;;
 			esac
@@ -268,12 +270,13 @@ find_working_mirror() {
 	return 1
 }
 
-# One-pass selection over mirrors: for each mirror, check mirror base first,
-# then check assets for gcc and binutils. Stop as soon as each asset is found;
-# returns success only if both are resolved.
+# Speed-based mirror selection: find the fastest available mirror that
+# serves both gcc and binutils tarballs.
 
-if ! versions; then
-	case $? in
+versions
+versions_rc=$?
+if [[ $versions_rc -ne 0 ]]; then
+	case $versions_rc in
 		2) exit 2 ;;
 		*) exit 1 ;;
 	esac

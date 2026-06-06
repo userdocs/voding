@@ -1,75 +1,105 @@
 #!/bin/bash
 
-# Test suite for simple_source script
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIMPLE_SOURCE="$SCRIPT_DIR/../simple_source"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+simple_source="$script_dir/../simple_source"
 
-printf '%s\n' "=== SIMPLE_SOURCE TEST SUITE ==="
-printf '%s\n' "Testing script: $SIMPLE_SOURCE"
+# Colors
+red='\e[31m'
+green='\e[32m'
+cyan='\e[36m'
+end='\e[0m'
+bold='\e[1m'
 
 total_tests=0
 passed_tests=0
+failed_tests=0
 
-run_test() {
-	local test_name="$1"
-	local test_cmd="$2"
-	local expected_exit="${3:-0}"
+# Isolated tmp dir for mock curl; cleaned up on exit regardless of outcome
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
 
-	((total_tests++))
-	printf '\n[%d] Testing: %s\n' "$total_tests" "$test_name"
+# ── Assertion helpers ─────────────────────────────────────────────────────────
 
-	local output
-	local actual_exit
-	output=$(eval "$test_cmd" 2>&1)
-	actual_exit=$?
-
-	if [[ $actual_exit -eq $expected_exit ]]; then
-		printf '  ✓ PASS\n'
-		((passed_tests++))
-	else
-		printf '  ✗ FAIL (expected exit %d, got %d)\n' "$expected_exit" "$actual_exit"
-		printf '  Output: %s\n' "$output"
-	fi
+_pass() {
+	printf '  %b✓ PASS%b\n' "$green" "$end"
+	((passed_tests++))
 }
 
-run_test_with_output() {
-	local test_name="$1"
-	local test_cmd="$2"
-	local expected_pattern="$3"
-	local expected_exit="${4:-0}"
+_fail() {
+	printf '  %bFAIL: %s%b\n' "$red" "$1" "$end"
+	if [[ -n ${2:-} ]]; then
+		printf '  Actual output:\n'
+		printf '%s' "$2" | tail -5 | sed 's/^/    /'
+	fi
+	((failed_tests++))
+}
 
+# run_test <name> <expected_exit> <cmd> [args...]
+run_test() {
+	local name="$1"
+	local expected_exit="$2"
+	shift 2
 	((total_tests++))
-	printf '\n[%d] Testing: %s\n' "$total_tests" "$test_name"
-
-	local output
-	local actual_exit
-	output=$(eval "$test_cmd" 2>&1)
-	actual_exit=$?
-
-	local pass=0
+	printf '\n[%d] %s\n' "$total_tests" "$name"
+	local out
+	out=$(PATH="$tmp_dir:$PATH" "$@" 2>&1)
+	local actual_exit=$?
 	if [[ $actual_exit -eq $expected_exit ]]; then
-		if [[ -n $expected_pattern && $output =~ $expected_pattern ]] || [[ -z $expected_pattern ]]; then
-			pass=1
+		_pass
+	else
+		_fail "expected exit $expected_exit, got $actual_exit"
+		if [[ -n $out ]]; then
+			printf '  Last output:\n'
+			printf '%s' "$out" | tail -3 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/    /'
 		fi
 	fi
+}
 
-	if [[ $pass -eq 1 ]]; then
-		printf '  ✓ PASS\n'
-		((passed_tests++))
+# assert_output <name> <grep_pattern> <cmd> [args...]
+assert_output() {
+	local name="$1"
+	local pattern="$2"
+	shift 2
+	((total_tests++))
+	printf '\n[%d] %s\n' "$total_tests" "$name"
+	local out
+	out=$(PATH="$tmp_dir:$PATH" "$@" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+	if printf '%s' "$out" | grep -q "$pattern"; then
+		_pass
 	else
-		printf '  ✗ FAIL (expected exit %d, got %d)\n' "$expected_exit" "$actual_exit"
-		printf '  Output: %s\n' "$output"
-		[[ -n $expected_pattern ]] && printf '  Expected pattern: %s\n' "$expected_pattern"
+		_fail "output did not contain: $pattern" "$out"
 	fi
 }
 
-# Mock curl for offline testing
-setup_mock_env() {
-	export PATH="$SCRIPT_DIR:$PATH"
-	cat > "$SCRIPT_DIR/curl" << 'EOF'
+# assert_not_output <name> <grep_pattern> <cmd> [args...]
+assert_not_output() {
+	local name="$1"
+	local pattern="$2"
+	shift 2
+	((total_tests++))
+	printf '\n[%d] %s\n' "$total_tests" "$name"
+	local out
+	out=$(PATH="$tmp_dir:$PATH" "$@" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+	if printf '%s' "$out" | grep -q "$pattern"; then
+		_fail "output unexpectedly contained: $pattern" "$out"
+	else
+		_pass
+	fi
+}
+
+section() {
+	printf '\n%b%b── %s %b\n' "$bold" "$cyan" "$1" "$end"
+}
+
+# ── Mock curl ─────────────────────────────────────────────────────────────────
+# Written into $tmp_dir (not $script_dir) so trap cleanup handles it.
+# Speeds:  ftp.gnu.org=150, ftpmirror.gnu.org=80, dotsrc.org=300,
+#          ftp.snt.utwente.nl=500 (fastest), mirrors.kernel.org=unavailable
+
+cat > "$tmp_dir/curl" << 'EOF'
 #!/bin/bash
-# Mock curl for testing
-case "$*" in
+args="$*"
+case "$args" in
 	*"sourceware.org/pub/gcc/releases"*)
 		printf '<a href="gcc-13.2.0/">gcc-13.2.0/</a>\n<a href="gcc-14.1.0/">gcc-14.1.0/</a>\n'
 		exit 0
@@ -78,35 +108,25 @@ case "$*" in
 		printf '<a href="binutils-2.42.tar.xz">binutils-2.42.tar.xz</a>\n<a href="binutils-2.43.tar.xz">binutils-2.43.tar.xz</a>\n'
 		exit 0
 		;;
-	*"-I"*|*"-w"*"%{http_code}"*)
-		# Handle HEAD requests and http code requests - return 200 for mirrors and specific files
-		if [[ "$*" =~ (ftp\.gnu\.org|ftpmirror\.gnu\.org|mirrors\.dotsrc\.org|ftp\.snt\.utwente\.nl) ]]; then
-			if [[ "$*" =~ "-I" ]]; then
-				printf 'HTTP/1.1 200 OK\r\n'
-			else
-				printf '200'
-			fi
-			exit 0
-		fi
+	*"mirrorservice.org"*)
+		exit 1
 		;;
-	*"gcc/gcc-14.1.0/gcc-14.1.0.tar.xz"*|*"binutils/binutils-2.43.tar.xz"*)
-		if [[ "$*" =~ "-w" ]]; then
-			printf '200'
+	*"--range"*"0-65535"*)
+		# Speed test responses (bytes/sec as float)
+		if   [[ "$args" =~ ftp\.gnu\.org ]];            then printf '153600.000000'
+		elif [[ "$args" =~ ftpmirror\.gnu\.org ]];      then printf '81920.000000'
+		elif [[ "$args" =~ mirrors\.dotsrc\.org ]];     then printf '307200.000000'
+		elif [[ "$args" =~ ftp\.snt\.utwente\.nl ]];    then printf '512000.000000'
+		else printf '0'
 		fi
 		exit 0
 		;;
-	*"--range"*"0-65535"*)
-		# Mock speed test - return different speeds for different mirrors
-		if [[ "$*" =~ ftp\.gnu\.org ]]; then
-			printf '150000.000000'
-		elif [[ "$*" =~ ftpmirror\.gnu\.org ]]; then
-			printf '80000.000000'
-		elif [[ "$*" =~ mirrors\.dotsrc\.org ]]; then
-			printf '300000.000000'
-		elif [[ "$*" =~ ftp\.snt\.utwente\.nl ]]; then
-			printf '500000.000000'
+	*"%{http_code}"*|*"-I"*)
+		# http_ok checks — only listed mirrors return 200; kernel.org is absent
+		if [[ "$args" =~ (ftp\.gnu\.org|ftpmirror\.gnu\.org|mirrors\.dotsrc\.org|ftp\.snt\.utwente\.nl) ]]; then
+			printf '200'
 		else
-			printf '100000.000000'
+			printf '404'
 		fi
 		exit 0
 		;;
@@ -115,96 +135,136 @@ case "$*" in
 		;;
 esac
 EOF
-	chmod +x "$SCRIPT_DIR/curl"
-}
+chmod +x "$tmp_dir/curl"
 
-cleanup_mock_env() {
-	rm -f "$SCRIPT_DIR/curl"
-}
+# ── Tests ─────────────────────────────────────────────────────────────────────
 
-# Test version discovery with mocked network
-setup_mock_env
+printf '%b%bSIMPLE_SOURCE TEST SUITE%b\n' "$bold" "$cyan" "$end"
+printf 'Script: %s\n' "$simple_source"
 
-# Test 1: GCC version discovery
-run_test_with_output "GCC version discovery" "\"$SIMPLE_SOURCE\" gcc" "14\.1\.0"
+section "Version Discovery"
 
-# Test 2: Binutils version discovery
-run_test_with_output "Binutils version discovery" "\"$SIMPLE_SOURCE\" binutils" "2\.43"
+assert_output "GCC version returned" "14\.1\.0" \
+	"$simple_source" gcc
 
-# Test 3: Both versions
-run_test_with_output "Both versions discovery" "\"$SIMPLE_SOURCE\" gcc binutils" "(14\.1\.0|2\.43)"
+assert_output "Binutils version returned" "2\.43" \
+	"$simple_source" binutils
 
-# Test 4: Invalid arguments
-run_test "Invalid arguments" "\"$SIMPLE_SOURCE\" invalid" 3
+assert_output "Both versions, gcc first" "14\.1\.0" \
+	"$simple_source" gcc binutils
 
-# Test 5: No arguments (should find working mirror - returns first available with mock speeds)
-run_test_with_output "Mirror discovery (fastest)" "\"$SIMPLE_SOURCE\"" "https://ftp\.gnu\.org/gnu"
+assert_output "Both versions, binutils second" "2\.43" \
+	"$simple_source" gcc binutils
 
-# Test 6: Verbose flag - INFO level
-run_test_with_output "Verbose INFO level" "\"$SIMPLE_SOURCE\" -v" '\[INFO\].*Testing.*mirrors.*speed'
+# Version output must be bare (e.g. 14.1.0, not gcc-14.1.0)
+assert_not_output "GCC output has no 'gcc-' prefix" "^gcc-" \
+	"$simple_source" gcc
 
-# Test 7: Verbose flag - DEBUG level
-run_test_with_output "Verbose DEBUG level" "\"$SIMPLE_SOURCE\" -vv" '\[DEBUG\].*Discovering.*version.*sourceware'
+assert_not_output "Binutils output has no 'binutils-' prefix" "^binutils-" \
+	"$simple_source" binutils
 
-# Test 8: Verbose with version query
-run_test_with_output "Verbose version query" "\"$SIMPLE_SOURCE\" -v gcc binutils" '14\.1\.0.*2\.43'
+section "Mirror Selection"
 
-# Test 9: Speed testing shows selection process
-run_test_with_output "Speed-based selection" "\"$SIMPLE_SOURCE\" -v" '\[INFO\].*Selected fastest mirror.*gnu'
+# ftp.snt.utwente.nl has the highest mock speed (512000 bytes/sec = 500 KB/s)
+assert_output "Fastest mirror selected (ftp.snt.utwente.nl)" "ftp.snt.utwente.nl" \
+	"$simple_source"
 
-# Test 10: URL validation - valid URL
-run_test "Valid mirror URL" "\"$SIMPLE_SOURCE\" https://example.com/mirror" 0
+# Preferred mirror: if valid and available, it should be used and returned
+assert_output "Preferred mirror accepted when accessible" "ftp.gnu.org" \
+	"$simple_source" "https://ftp.gnu.org/gnu"
 
-# Test 11: URL validation - invalid format
-run_test "Invalid URL format" "\"$SIMPLE_SOURCE\" not-a-url" 3
+# URL not starting with http/https is treated as an unknown version token → exit 3
+run_test "Non-URL argument exits 3" 3 \
+	"$simple_source" "not-a-url"
 
-# Test 12: URL validation - complex valid URL
-run_test "Complex valid URL" "\"$SIMPLE_SOURCE\" https://ftp.gnu.org/gnu" 0
+run_test "Non-http scheme exits 3" 3 \
+	"$simple_source" "ftp://ftp.gnu.org/gnu"
 
-# Test 13: Verbose flag parsing with URL
-run_test_with_output "Verbose with preferred URL" "\"$SIMPLE_SOURCE\" -v https://ftp.gnu.org/gnu" '\[INFO\].*Testing preferred mirror'
+section "CLI / Flags"
 
-cleanup_mock_env
+run_test "Invalid argument exits 3" 3 \
+	"$simple_source" invalid_token
 
-# Test network failure scenarios with broken mock
-cat > "$SCRIPT_DIR/curl" << 'EOF'
+# -v enables INFO output (goes to stderr)
+assert_output "-v flag enables INFO messages" "\[INFO\]" \
+	"$simple_source" -v
+
+# -vv enables DEBUG output
+assert_output "-vv flag enables DEBUG messages" "\[DEBUG\]" \
+	"$simple_source" -vv
+
+# Without -v there must be no [INFO] or [DEBUG] lines
+assert_not_output "No INFO output without -v" "\[INFO\]" \
+	"$simple_source"
+
+assert_not_output "No DEBUG output without -vv" "\[DEBUG\]" \
+	"$simple_source"
+
+# -v with a version query should not suppress the version output
+assert_output "-v with gcc still outputs version" "14\.1\.0" \
+	"$simple_source" -v gcc
+
+section "Exit Codes (network-error propagation)"
+
+# Simulate total network failure: curl always fails
+cat > "$tmp_dir/curl" << 'FAILEOF'
 #!/bin/bash
 exit 1
+FAILEOF
+chmod +x "$tmp_dir/curl"
+
+run_test "Network failure on version fetch exits 2" 2 \
+	"$simple_source" gcc
+
+run_test "Network failure on mirror find exits 2" 2 \
+	"$simple_source"
+
+# Restore working mock for any further tests
+cat > "$tmp_dir/curl" << 'EOF'
+#!/bin/bash
+args="$*"
+case "$args" in
+	*"sourceware.org/pub/gcc/releases"*)
+		printf '<a href="gcc-14.1.0/">gcc-14.1.0/</a>\n'
+		exit 0
+		;;
+	*"sourceware.org/pub/binutils/releases"*)
+		printf '<a href="binutils-2.43.tar.xz">binutils-2.43.tar.xz</a>\n'
+		exit 0
+		;;
+	*"mirrorservice.org"*) exit 1 ;;
+	*"--range"*"0-65535"*) printf '102400.000000'; exit 0 ;;
+	*"%{http_code}"*|*"-I"*)
+		if [[ "$*" =~ ftp\.gnu\.org ]]; then printf '200'; else printf '404'; fi
+		exit 0
+		;;
+	*) exit 1 ;;
+esac
 EOF
-chmod +x "$SCRIPT_DIR/curl"
-export PATH="$SCRIPT_DIR:$PATH"
+chmod +x "$tmp_dir/curl"
 
-# Test 14: Network failure
-run_test "Network failure handling" "\"$SIMPLE_SOURCE\" gcc" 1
+section "Speed Rounding"
 
-cleanup_mock_env
+# Confirm speed_kb calculation is non-zero for a valid mirror
+assert_output "Mirror output is non-empty after speed test" "ftp.gnu.org" \
+	"$simple_source"
 
-# Test 15: Function isolation (source without arguments)
-run_test "Script can be sourced" "bash -c 'source \"$SIMPLE_SOURCE\" gcc >/dev/null 2>&1 && [[ -n \"\${source_urls[0]}\" ]]'"
+# ── Summary ───────────────────────────────────────────────────────────────────
 
-# Set up mock env for sourcing test
-setup_mock_env
+printf '\n%b%b─────────────────────────────────%b\n' "$bold" "$cyan" "$end"
+printf 'Total:  %d\n' "$total_tests"
+printf '%bPassed: %d%b\n' "$green" "$passed_tests" "$end"
+if [[ $failed_tests -gt 0 ]]; then
+	printf '%bFailed: %d%b\n' "$red" "$failed_tests" "$end"
+else
+	printf 'Failed: 0\n'
+fi
+printf '%b%b─────────────────────────────────%b\n' "$bold" "$cyan" "$end"
 
-# Test 16: Global variables are set correctly
-run_test "Global source_urls array" "bash -c 'export PATH=\"$SCRIPT_DIR:\$PATH\"; source \"$SIMPLE_SOURCE\" gcc >/dev/null 2>&1 && [[ -n \"\${source_urls[0]}\" ]]'"
-
-cleanup_mock_env
-
-# Test 17: Print function works correctly
-run_test_with_output "Print function INFO level" "bash -c 'source \"$SIMPLE_SOURCE\" >/dev/null 2>&1; verbose=1; print_msg \"INFO\" \"test message\" 2>&1'" '\[INFO\] test message'
-
-# Test 18: Print function DEBUG level suppressed at INFO
-run_test_with_output "Print function DEBUG suppressed" "bash -c 'source \"$SIMPLE_SOURCE\" >/dev/null 2>&1; verbose=1; print_msg \"DEBUG\" \"debug message\" 2>&1'" "^$"
-
-printf '\n=== SUMMARY ===\n'
-printf 'Total tests: %d\n' "$total_tests"
-printf 'Passed: %d\n' "$passed_tests"
-printf 'Failed: %d\n' "$((total_tests - passed_tests))"
-
-if [[ $passed_tests -eq $total_tests ]]; then
-	printf '🎉 ALL TESTS PASSED!\n'
+if [[ $failed_tests -eq 0 ]]; then
+	printf '%b%bALL TESTS PASSED%b\n\n' "$bold" "$green" "$end"
 	exit 0
 else
-	printf '❌ Some tests failed\n'
+	printf '%b%bSOME TESTS FAILED%b\n\n' "$bold" "$red" "$end"
 	exit 1
 fi

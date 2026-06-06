@@ -10,28 +10,6 @@ printf '%s\n' "Testing script: $SIMPLE_SOURCE (requires network)"
 total_tests=0
 passed_tests=0
 
-run_test() {
-	local test_name="$1"
-	local test_cmd="$2"
-	local expected_exit="${3:-0}"
-
-	((total_tests++))
-	printf '\n[%d] Testing: %s\n' "$total_tests" "$test_name"
-
-	local output
-	local actual_exit
-	output=$(timeout 30 bash -c "$test_cmd" 2>&1)
-	actual_exit=$?
-
-	if [[ $actual_exit -eq $expected_exit ]]; then
-		printf '  ✓ PASS\n'
-		((passed_tests++))
-	else
-		printf '  ✗ FAIL (expected exit %d, got %d)\n' "$expected_exit" "$actual_exit"
-		printf '  Output: %s\n' "$output"
-	fi
-}
-
 run_test_with_output() {
 	local test_name="$1"
 	local test_cmd="$2"
