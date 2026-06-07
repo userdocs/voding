@@ -76,11 +76,6 @@ log_warn() {
 	printf '[WARN] %s\n' "$1" >&2
 }
 
-log_summary() {
-	printf '%b\n' '```bash' | tee -a "$GITHUB_STEP_SUMMARY"
-	printf '%b\n' "${1}" | tee -a "$GITHUB_STEP_SUMMARY"
-	printf '%b\n' '```' | tee -a "$GITHUB_STEP_SUMMARY"
-}
 
 #=============================================================================
 # VALIDATION FUNCTIONS
@@ -267,7 +262,7 @@ detect_os_userdocs() {
 		# Parse base.name (e.g., "alpine:edge")
 		local base_os
 		base_os="${base_name%%:*}" # Extract part before :
-		base_os="${base_os%%/*}"   # Extract part before / (in case of registry prefix)
+		base_os="${base_os##*/}"   # Extract part after last / (in case of registry prefix)
 		case "$base_os" in
 			alpine)
 				detected_os="alpine"
@@ -480,7 +475,7 @@ sanitize_env_file() {
 		while IFS= read -r line; do
 			[[ -z $line || $line =~ ^[[:space:]]*# ]] && continue
 			# Use centralized validation
-			if validate_input "$line" "env_var" 2> /dev/null; then
+			if ( validate_input "$line" "env_var" 2> /dev/null ); then
 				printf '%s\n' "$line"
 			else
 				log_error "Security: Invalid environment variable blocked: $line"
@@ -491,20 +486,22 @@ sanitize_env_file() {
 
 # Process environment configuration
 process_environment() {
+	local use_host=false
 	if [[ $inputs_use_host_env == 'true' ]]; then
 		env > "${workspace}/env.host"
 		log_info "Security: Host environment dumped - review for sensitive data"
+		use_host=true
 	fi
 
-	if [[ -f "${workspace}/env.host" && -f "${workspace}/env.custom" ]]; then
+	if [[ $use_host == true && -f "${workspace}/env.custom" ]]; then
 		sanitize_env_file "${workspace}/env.host" "${workspace}/env.host.safe"
 		sanitize_env_file "${workspace}/env.custom" "${workspace}/env.custom.safe"
 		cat "${workspace}/env.host.safe" "${workspace}/env.custom.safe" > "${workspace}/env.load"
 		env_custom="host + custom (sanitized)"
-	elif [[ -f "${workspace}/env.host" && ! -f "${workspace}/env.custom" ]]; then
+	elif [[ $use_host == true && ! -f "${workspace}/env.custom" ]]; then
 		sanitize_env_file "${workspace}/env.host" "${workspace}/env.load"
 		env_custom="host only (sanitized)"
-	elif [[ ! -f "${workspace}/env.host" && -f "${workspace}/env.custom" ]]; then
+	elif [[ $use_host == false && -f "${workspace}/env.custom" ]]; then
 		sanitize_env_file "${workspace}/env.custom" "${workspace}/env.load"
 		env_custom="custom only (sanitized)"
 	else
@@ -596,9 +593,9 @@ parse_docker_commands() {
 		fi
 
 		# Handle long options securely
-		if [[ $e_trim =~ ^(--(?:env|volume|user|workdir|memory|cpus))[[:space:]]+(.+) ]]; then
+		if [[ $e_trim =~ ^(--(env|volume|user|workdir|memory|cpus))[[:space:]]+(.+) ]]; then
 			clean_envs+=("${BASH_REMATCH[1]}")
-			_val="${BASH_REMATCH[2]}"
+			_val="${BASH_REMATCH[3]}"
 			_val="${_val//\$\{wd\}/$wd}"
 			_val="${_val//\$wd/$wd}"
 			# Additional security check
@@ -732,8 +729,8 @@ generate_standard_dockerfile() {
 				"  elif command -v apk >/dev/null 2>&1; then ${backslash}"
 				"    apk update >/dev/null 2>&1 && apk upgrade >/dev/null 2>&1 && apk add --no-cache sudo${inputs_additional_apps_array[*]:+ ${inputs_additional_apps_array[*]}} >/dev/null 2>&1; ${backslash}"
 				"  fi && ${backslash}"
-				"    groupadd -g ${non_root_gid} ${non_root_user} 2>/dev/null || addgroup ${non_root_gid} 2>/dev/null || true && ${backslash}"
-				"    useradd -ms /bin/bash -u ${non_root_uid} ${non_root_user} 2>/dev/null || adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} ${non_root_user} 2>/dev/null || true && ${backslash}"
+				"    groupadd -g ${non_root_gid} ${non_root_user} 2>/dev/null || addgroup -g ${non_root_gid} ${non_root_user} 2>/dev/null || true && ${backslash}"
+				"    useradd -ms /bin/bash -u ${non_root_uid} -g ${non_root_gid} ${non_root_user} 2>/dev/null || adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} -G ${non_root_user} ${non_root_user} 2>/dev/null || true && ${backslash}"
 				"    if command -v sudo >/dev/null 2>&1; then umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && chmod 0440 /etc/sudoers.d/${non_root_user}; fi"
 			)
 			;;
@@ -747,7 +744,7 @@ generate_standard_dockerfile() {
 #=============================================================================
 
 _inputs_info() {
-	printf '%b\n' "\`\`\`bash\n"
+	printf '%b\n' '```bash'
 	log_debug "=== INPUT INFO ==="
 	log_debug ""
 	log_debug "inputs_dockerfile=\"${inputs_dockerfile}\""
@@ -814,7 +811,7 @@ _inputs_info() {
 	printf '%b\n' '```'
 }
 
-# These are set to github env/outputs and cannot be changed or manipulated by inputs"
+# These are set to github env/outputs and cannot be changed or manipulated by inputs
 _env_info() {
 	# Set environment variables using the helper function
 	to_gh_env "container_name=${container_name}"
@@ -833,7 +830,7 @@ _env_info() {
 to_gh_env() {
 	local env_var="$1"
 	# Use centralized validation
-	if ! validate_input "$env_var" "env_var" 2> /dev/null; then
+	if ! ( validate_input "$env_var" "env_var" 2> /dev/null ); then
 		log_error "Security: Invalid environment variable for GitHub ENV: $env_var"
 		return 1
 	fi
@@ -843,7 +840,7 @@ to_gh_env() {
 to_gh_output() {
 	local output_var="$1"
 	# Use centralized validation
-	if ! validate_input "$output_var" "env_var" 2> /dev/null; then
+	if ! ( validate_input "$output_var" "env_var" 2> /dev/null ); then
 		log_error "Security: Invalid output variable for GitHub OUTPUT: $output_var"
 		return 1
 	fi
@@ -903,7 +900,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		# Write Dockerfile to the step summary for visibility
 		log_info "Using Dockerfile: $dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
 		{
-			printf '%b\n' "\`\`\`bash\n"
+			printf '%b\n' '```bash'
 			cat "$dockerfile_path"
 			printf '%b\n' '```'
 		} | tee -a "$GITHUB_STEP_SUMMARY"
@@ -938,7 +935,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 				wd="$extracted_wd"
 			else
 				# Log warning about invalid WORKDIR (but continue with default)
-				printf '[%s] [WARN] Security: Invalid WORKDIR path found in Dockerfile, using default: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$extracted_wd" >&2
+				log_warn "Security: Invalid WORKDIR path found in Dockerfile, using default: $extracted_wd"
 			fi
 		fi
 
@@ -1020,7 +1017,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		esac
 	fi
 
-	printf '%b\n' "\`\`\`bash\n" >> "$GITHUB_STEP_SUMMARY"
+	printf '%b\n' '```bash' >> "$GITHUB_STEP_SUMMARY"
 	{
 		if [[ $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
 			# Special handling for userdocs images - they already have user setup

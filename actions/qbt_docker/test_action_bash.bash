@@ -438,6 +438,18 @@ if [[ -f "${_ws_host}/env.host" ]]; then
 	_pass
 else _fail "env.host was not created" "$(last_output)"; fi
 
+# env.host from workspace should be ignored if inputs_use_host_env=false
+_ws_host_ignore="${tmp_dir}/ws_host_ignore"
+mkdir -p "$_ws_host_ignore"
+printf 'EVIL_VAR=bad\n' > "${_ws_host_ignore}/env.host"
+invoke_script --workspace "$_ws_host_ignore" inputs_use_host_env="false"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "env.host ignored when inputs_use_host_env=false"
+if ! grep -q "EVIL_VAR" "${_ws_host_ignore}/env.load" 2> /dev/null; then
+	_pass
+else
+	_fail "env.host was loaded even though inputs_use_host_env=false" "$(cat "${_ws_host_ignore}/env.load" 2> /dev/null)"
+fi
+
 #─────────────────────────────────────────────────────
 section "Custom Docker Commands"
 #─────────────────────────────────────────────────────
