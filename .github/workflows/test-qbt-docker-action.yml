@@ -89,7 +89,7 @@ jobs:
           inputs_platform: ""
           inputs_dockerfile: ""
           inputs_custom_docker_commands: ""
-        run: env GITHUB_ENV=/tmp/act_gh_env GITHUB_OUTPUT=/tmp/act_gh_output GITHUB_STEP_SUMMARY=/tmp/act_gh_summary bash actions/qbt_docker/action.bash
+        run: env GITHUB_OUTPUT=/tmp/act_gh_output bash actions/qbt_docker/action.bash
 
       - name: Verify container is running
         run: docker ps --filter name=qbt_builder --format '{{.Names}}' | grep -q qbt_builder
@@ -128,7 +128,7 @@ jobs:
           inputs_platform: ""
           inputs_dockerfile: ""
           inputs_custom_docker_commands: ""
-        run: env GITHUB_ENV=/tmp/act_gh_env GITHUB_OUTPUT=/tmp/act_gh_output GITHUB_STEP_SUMMARY=/tmp/act_gh_summary bash actions/qbt_docker/action.bash
+        run: env GITHUB_OUTPUT=/tmp/act_gh_output bash actions/qbt_docker/action.bash
 
       - name: Verify curl is installed in container
         run: docker exec qbt_builder curl --version
@@ -171,7 +171,7 @@ jobs:
           inputs_platform: linux/amd64
           inputs_dockerfile: test.Dockerfile
           inputs_custom_docker_commands: ""
-        run: env GITHUB_ENV=/tmp/act_gh_env GITHUB_OUTPUT=/tmp/act_gh_output GITHUB_STEP_SUMMARY=/tmp/act_gh_summary bash actions/qbt_docker/action.bash
+        run: env GITHUB_OUTPUT=/tmp/act_gh_output bash actions/qbt_docker/action.bash
 
       - name: Verify WORKDIR extracted from Dockerfile
         # The runner picks up wd=/workspace from GITHUB_ENV after the action step
