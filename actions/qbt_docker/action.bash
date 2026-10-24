@@ -29,14 +29,14 @@
 inputs_dockerfile="${inputs_dockerfile:-}"
 inputs_use_host_env="${inputs_use_host_env:-false}"
 inputs_use_root="${inputs_use_root:-false}"
-inputs_os_id="${inputs_os_id:=alpine}"
-inputs_os_version_id="${inputs_os_version_id:=edge}"
+inputs_os_id="${inputs_os_id:-alpine}"
+inputs_os_version_id="${inputs_os_version_id:-edge}"
 inputs_custom_docker_commands="${inputs_custom_docker_commands:-}"
 inputs_additional_apps="${inputs_additional_apps:-}"
 inputs_platform="${inputs_platform:-}"
 # Runner architecture is provided by GitHub Actions as an external env var.
 # shellcheck disable=SC2153
-runner_arch=${RUNNER_ARCH}
+runner_arch="${RUNNER_ARCH:-}"
 
 # These variables are immutable and cannot be changed by injection or used to run subshell commands.
 readonly container_name="qbt_builder"
@@ -76,10 +76,31 @@ log_warn() {
 	printf '[WARN] %s\n' "$1" >&2
 }
 
-
 #=============================================================================
 # VALIDATION FUNCTIONS
 #=============================================================================
+
+# Non-exiting check for environment variable format and blocklist
+check_env_var() {
+	local input="$1"
+
+	# Validate environment variable format and block dangerous shell, loader, and GitHub runner vars.
+	# LD_, DYLD_, and BASH_ are prefix-matched to catch LD_PRELOAD, BASH_ENV, etc.
+	if [[ ! $input =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] \
+		|| [[ $input =~ ^(PATH|SHELL|HOME|ENV|IFS|CDPATH|PROMPT_COMMAND|PS4|GITHUB_ENV|GITHUB_OUTPUT|GITHUB_PATH|GITHUB_STEP_SUMMARY)= ]] \
+		|| [[ $input =~ ^(LD_|DYLD_|BASH_) ]]; then
+		return 1
+	fi
+
+	# Check for dangerous characters using case
+	case "$input" in
+		*\;* | *\&* | *\|* | *\<* | *\>* | *\`* | *\$\(*)
+			return 1
+			;;
+	esac
+
+	return 0
+}
 
 # Security input validation functions
 validate_input() {
@@ -107,28 +128,12 @@ validate_input() {
 				log_error "Security: Invalid dockerfile path blocked: $input"
 				exit 1
 			fi
-			# Additional check for dangerous characters
-			case "$input" in
-				*\;* | *\&* | *\|* | *\<* | *\>* | *\`* | *\$\(*)
-					log_error "Security: Dangerous characters in dockerfile path: $input"
-					exit 1
-					;;
-			esac
 			;;
 		"env_var")
-			# Validate environment variable format and block dangerous ones.
-			# LD_ and BASH_ are prefix-matched to catch LD_PRELOAD, BASH_ENV, etc.
-			if [[ ! $input =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || [[ $input =~ ^(PATH|SHELL|HOME)= ]] || [[ $input =~ ^(LD_|BASH_) ]]; then
+			if ! check_env_var "$input"; then
 				log_error "Security: Invalid environment variable blocked: $input"
 				exit 1
 			fi
-			# Check for dangerous characters using case
-			case "$input" in
-				*\;* | *\&* | *\|* | *\<* | *\>* | *\`* | *\$\(*)
-					log_error "Security: Dangerous characters in environment variable: $input"
-					exit 1
-					;;
-			esac
 			;;
 		"platform")
 			# Validate Docker platform format
@@ -137,17 +142,28 @@ validate_input() {
 				exit 1
 			fi
 			;;
+		*)
+			log_error "Security: Unknown validation type: $type"
+			exit 1
+			;;
 	esac
 }
 
 # Validate Docker commands against whitelist
 validate_docker_commands() {
+	local cmd_line
+	local -a tokens
+
 	for cmd_line in "${inputs_custom_docker_commands_array[@]}"; do
 		[[ -z ${cmd_line//[[:space:]]/} ]] && continue
 
 		read -ra tokens <<< "$cmd_line"
 		if [[ ${#tokens[@]} -gt 0 ]]; then
 			validate_input "${tokens[0]}" "docker_arg"
+			if [[ ${#tokens[@]} -lt 2 ]]; then
+				log_error "Security: Docker argument missing value: ${tokens[0]}"
+				exit 1
+			fi
 		fi
 	done
 }
@@ -201,9 +217,9 @@ detect_image_os() {
 	else
 		# Get the raw JSON first to avoid complex jq parsing in a single command
 		local docker_inspect_json
-		docker_inspect_json=$(docker buildx imagetools inspect "$image" --format '{{json .}}' 2> /dev/null || echo "")
+		docker_inspect_json=$(docker buildx imagetools inspect "$image" --format '{{json .}}' 2> /dev/null)
 
-		if [[ -n $docker_inspect_json && $docker_inspect_json != "" ]]; then
+		if [[ -n $docker_inspect_json ]]; then
 			# Section 1: GHCR userdocs-specific metadata parsing
 			detected_os=$(detect_os_userdocs "$docker_inspect_json")
 
@@ -238,15 +254,16 @@ detect_os_userdocs() {
 
 	log_debug "Checking for GHCR userdocs metadata" >&2
 
-	# Check for userdocs-specific labels
+	# Support both single-arch (.image.config.Labels) and multi-arch (.image[key].config.Labels) schemas
+	local labels_query='((.image | if has("config") or has("history") then . else .[keys[0]] end).config.Labels // {})'
 	local base_id
 	local base_name
-	base_id=$(echo "$docker_inspect_json" | jq -r 'try (.image[.image | keys[0]].config.Labels."org.opencontainers.image.base.id" // "")' 2> /dev/null || echo "")
-	base_name=$(echo "$docker_inspect_json" | jq -r 'try (.image[.image | keys[0]].config.Labels."org.opencontainers.image.base.name" // "")' 2> /dev/null || echo "")
+	base_id=$(jq -r "try (${labels_query}.\"org.opencontainers.image.base.id\" // \"\")" <<< "$docker_inspect_json" 2> /dev/null)
+	base_name=$(jq -r "try (${labels_query}.\"org.opencontainers.image.base.name\" // \"\")" <<< "$docker_inspect_json" 2> /dev/null)
 
-	if [[ -n $base_id && $base_id != "null" && $base_id != "" ]]; then
+	if [[ -n $base_id && $base_id != "null" ]]; then
 		log_debug "Found userdocs base.id: $base_id" >&2
-		case "$base_id" in
+		case "${base_id,,}" in
 			alpine)
 				detected_os="alpine"
 				;;
@@ -257,13 +274,13 @@ detect_os_userdocs() {
 				detected_os="ubuntu"
 				;;
 		esac
-	elif [[ -n $base_name && $base_name != "null" && $base_name != "" ]]; then
+	elif [[ -n $base_name && $base_name != "null" ]]; then
 		log_debug "Found userdocs base.name: $base_name" >&2
 		# Parse base.name (e.g., "alpine:edge")
 		local base_os
 		base_os="${base_name%%:*}" # Extract part before :
 		base_os="${base_os##*/}"   # Extract part after last / (in case of registry prefix)
-		case "$base_os" in
+		case "${base_os,,}" in
 			alpine)
 				detected_os="alpine"
 				;;
@@ -289,10 +306,11 @@ detect_os_official() {
 	log_debug "Checking for official Docker image patterns" >&2
 
 	# Check URL metadata for official Docker images
+	local labels_query='((.image | if has("config") or has("history") then . else .[keys[0]] end).config.Labels // {})'
 	local image_url
-	image_url=$(echo "$docker_inspect_json" | jq -r 'try (.image[.image | keys[0]].config.Labels."org.opencontainers.image.url" // "")' 2> /dev/null || echo "")
+	image_url=$(jq -r "try (${labels_query}.\"org.opencontainers.image.url\" // \"\")" <<< "$docker_inspect_json" 2> /dev/null)
 
-	if [[ -n $image_url && $image_url != "null" && $image_url != "" ]]; then
+	if [[ -n $image_url && $image_url != "null" ]]; then
 		log_debug "Found image URL: $image_url" >&2
 
 		case "$image_url" in
@@ -311,9 +329,10 @@ detect_os_official() {
 	# Secondary check: parse image name for official format
 	if [[ -z $detected_os ]]; then
 		local image_name
-		image_name=$(echo "$docker_inspect_json" | jq -r 'try (.name // "")' 2> /dev/null || echo "$image")
+		image_name=$(jq -r 'try (.name // "")' <<< "$docker_inspect_json" 2> /dev/null)
+		[[ -z $image_name || $image_name == "null" ]] && image_name="$image"
 
-		if [[ -n $image_name && $image_name != "null" ]]; then
+		if [[ -n $image_name ]]; then
 			log_debug "Checking image name: $image_name" >&2
 
 			# Handle arch-prefixed images (e.g., arm64v8/alpine:edge)
@@ -351,13 +370,13 @@ detect_os_fallback_with_metadata() {
 
 	log_debug "Using fallback detection with metadata" >&2
 
-	# Check history for OS hints
+	# Check history for OS hints (supports single-arch and multi-arch schemas)
 	local history_check
-	history_check=$(echo "$docker_inspect_json" | jq -r 'try (.image[.image | keys[0]].history[].created_by // "")' 2> /dev/null | grep -i -E 'alpine|debian|ubuntu' | head -1 || echo "")
+	history_check=$(jq -r 'try (((.image | if has("config") or has("history") then . else .[keys[0]] end).history // [])[].created_by // "")' <<< "$docker_inspect_json" 2> /dev/null | grep -i -E 'alpine|debian|ubuntu' | head -1)
 
 	if [[ -n $history_check ]]; then
 		log_debug "Found OS in history: $history_check" >&2
-		case "$history_check" in
+		case "${history_check,,}" in
 			*alpine*)
 				detected_os="alpine"
 				;;
@@ -383,6 +402,7 @@ detect_os_fallback_with_metadata() {
 detect_os_fallback() {
 	local image="$1"
 	local detected_os=""
+	local part
 
 	log_debug "Using name-only fallback detection" >&2
 
@@ -421,6 +441,9 @@ detect_os_fallback() {
 
 # Parse arch-prefixed image names and set platform
 setup_platform() {
+	local arch_prefix
+	local image_name
+
 	# Parse arch-prefixed image names (e.g., arm64v8/alpine:edge) and set platform
 	# Only match known architecture prefixes to avoid parsing registry URLs
 	if [[ $inputs_os_id =~ ^(amd64|i386|arm32v6|arm32v7|arm64v8|ppc64le|s390x|riscv64)/(.+)$ ]]; then
@@ -433,19 +456,21 @@ setup_platform() {
 			exit 1
 		fi
 
-		case "$arch_prefix" in
-			"amd64") inputs_platform="linux/amd64" ;;
-			"i386") inputs_platform="linux/i386" ;;
-			"arm32v6") inputs_platform="linux/arm/v6" ;;
-			"arm32v7") inputs_platform="linux/arm/v7" ;;
-			"arm64v8") inputs_platform="linux/arm64" ;;
-			"ppc64le") inputs_platform="linux/ppc64le" ;;
-			"s390x") inputs_platform="linux/s390x" ;;
-			"riscv64") inputs_platform="linux/riscv64" ;;
-		esac
+		if [[ -z $inputs_platform ]]; then
+			case "$arch_prefix" in
+				"amd64") inputs_platform="linux/amd64" ;;
+				"i386") inputs_platform="linux/i386" ;;
+				"arm32v6") inputs_platform="linux/arm/v6" ;;
+				"arm32v7") inputs_platform="linux/arm/v7" ;;
+				"arm64v8") inputs_platform="linux/arm64" ;;
+				"ppc64le") inputs_platform="linux/ppc64le" ;;
+				"s390x") inputs_platform="linux/s390x" ;;
+				"riscv64") inputs_platform="linux/riscv64" ;;
+			esac
 
-		# Keep the full arch-prefixed image name - Docker needs it to pull the correct variant
-		log_debug "Detected arch-prefixed image: $inputs_os_id -> platform: $inputs_platform"
+			# Keep the full arch-prefixed image name - Docker needs it to pull the correct variant
+			log_debug "Detected arch-prefixed image: $inputs_os_id -> platform: $inputs_platform"
+		fi
 	fi
 
 	# Set default platform based on runner architecture only if inputs_platform is still empty/null/unset
@@ -457,7 +482,7 @@ setup_platform() {
 			"ARM64") inputs_platform="linux/arm64" ;;
 			*) inputs_platform="linux/amd64" ;; # fallback to amd64
 		esac
-		log_debug "Using runner architecture detection: ${RUNNER_ARCH:-unknown} -> platform: $inputs_platform"
+		log_debug "Using runner architecture detection: ${runner_arch:-unknown} -> platform: $inputs_platform"
 	fi
 }
 
@@ -469,13 +494,14 @@ setup_platform() {
 sanitize_env_file() {
 	local input_file="$1"
 	local output_file="$2"
+	local line
 
 	if [[ -f $input_file ]]; then
 		# Filter valid env vars and block dangerous ones
 		while IFS= read -r line; do
 			[[ -z $line || $line =~ ^[[:space:]]*# ]] && continue
-			# Use centralized validation
-			if ( validate_input "$line" "env_var" 2> /dev/null ); then
+			# Use centralized validation without subshell fork
+			if check_env_var "$line"; then
 				printf '%s\n' "$line"
 			else
 				log_error "Security: Invalid environment variable blocked: $line"
@@ -487,8 +513,15 @@ sanitize_env_file() {
 # Process environment configuration
 process_environment() {
 	local use_host=false
+	local entry
+
+	# Ensure no stale env.load or intermediate files are carried over
+	rm -f "${workspace}/env.load" "${workspace}/env.host.safe" "${workspace}/env.custom.safe"
+
 	if [[ $inputs_use_host_env == 'true' ]]; then
-		env > "${workspace}/env.host"
+		while IFS= read -r -d '' entry; do
+			[[ $entry != *$'\n'* ]] && printf '%s\n' "$entry"
+		done < <(env -0) > "${workspace}/env.host"
 		log_info "Security: Host environment dumped - review for sensitive data"
 		use_host=true
 	fi
@@ -497,6 +530,7 @@ process_environment() {
 		sanitize_env_file "${workspace}/env.host" "${workspace}/env.host.safe"
 		sanitize_env_file "${workspace}/env.custom" "${workspace}/env.custom.safe"
 		cat "${workspace}/env.host.safe" "${workspace}/env.custom.safe" > "${workspace}/env.load"
+		rm -f "${workspace}/env.host.safe" "${workspace}/env.custom.safe"
 		env_custom="host + custom (sanitized)"
 	elif [[ $use_host == true && ! -f "${workspace}/env.custom" ]]; then
 		sanitize_env_file "${workspace}/env.host" "${workspace}/env.load"
@@ -536,7 +570,7 @@ parse_app_list() {
 	normalized_input=$(printf '%s' "$input" | tr -d '\r' | tr '\n' ' ')
 
 	# Split on whitespace to handle different YAML formats
-	local temp_array
+	local -a temp_array
 	read -r -a temp_array <<< "$normalized_input"
 
 	# Filter out empty elements
@@ -550,6 +584,12 @@ parse_app_list() {
 
 # Parse and validate docker commands
 parse_docker_commands() {
+	local pkg
+	local e
+	local e_trim
+	local _flag
+	local _val
+
 	# Parse inputs
 	parse_app_list "$inputs_additional_apps" inputs_additional_apps_array
 
@@ -573,54 +613,29 @@ parse_docker_commands() {
 			continue
 		fi
 
-		# Trim leading/trailing whitespace
-		e_trim=$(printf '%s' "$e" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+		# Trim leading/trailing whitespace using parameter expansion
+		e_trim="${e#"${e%%[![:space:]]*}"}"
+		e_trim="${e_trim%"${e_trim##*[![:space:]]}"}"
 
-		# Parse securely - only process whitelisted arguments
-		if [[ $e_trim =~ ^-([evuw])[[:space:]]+(.+) ]]; then
-			clean_envs+=("-${BASH_REMATCH[1]}")
-			# Only expand safe variables (wd only)
-			_val="${BASH_REMATCH[2]}"
-			_val="${_val//\$\{wd\}/$wd}"
-			_val="${_val//\$wd/$wd}"
-			# Additional security: prevent command substitution and unsafe expansions
-			if [[ $_val =~ \$\(|\`|\$\{[^w]|\$[^w{] ]]; then
-				log_error "Security: Command substitution or unsafe variable expansion blocked in: $_val"
-				exit 1
-			fi
-			clean_envs+=("$_val")
-			continue
-		fi
-
-		# Handle long options securely
-		if [[ $e_trim =~ ^(--(env|volume|user|workdir|memory|cpus))[[:space:]]+(.+) ]]; then
-			clean_envs+=("${BASH_REMATCH[1]}")
+		# Parse securely - only process whitelisted short and long options with a value
+		if [[ $e_trim =~ ^(-[evuw]|--(env|volume|user|workdir|memory|cpus))[[:space:]]+(.+)$ ]]; then
+			_flag="${BASH_REMATCH[1]}"
 			_val="${BASH_REMATCH[3]}"
+
+			# Only expand safe variable ($wd / ${wd}) when not part of a longer identifier
 			_val="${_val//\$\{wd\}/$wd}"
-			_val="${_val//\$wd/$wd}"
-			# Additional security check
-			if [[ $_val =~ \$\(|\`|\$\{[^w]|\$[^w{] ]]; then
+			while [[ $_val =~ ^(.*)\$wd([^A-Za-z0-9_].*|$) ]]; do
+				_val="${BASH_REMATCH[1]}${wd}${BASH_REMATCH[2]}"
+			done
+
+			# Block any remaining variable expansions or command substitutions
+			if [[ $_val =~ [\$\`] ]]; then
 				log_error "Security: Command substitution or unsafe variable expansion blocked in: $_val"
 				exit 1
 			fi
-			clean_envs+=("$_val")
-			continue
-		fi
 
-		# For other formats, split carefully and validate each token
-		read -r -a tokens <<< "$e_trim"
-		for t in "${tokens[@]}"; do
-			# Only expand safe variables
-			_t="$t"
-			_t="${_t//\$\{wd\}/$wd}"
-			_t="${_t//\$wd/$wd}"
-			# Security check for command substitution
-			if [[ $_t =~ \$\(|\`|\$\{[^w]|\$[^w{] ]]; then
-				log_error "Security: Command substitution or unsafe variable expansion blocked in: $_t"
-				exit 1
-			fi
-			clean_envs+=("$_t")
-		done
+			clean_envs+=("$_flag" "$_val")
+		fi
 	done
 }
 
@@ -786,10 +801,14 @@ _inputs_info() {
 	fi
 
 	# Show custom dockerfile decision
-	log_debug "custom_dockerfile_needed=true"
-	if [[ $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
+	if [[ -n $inputs_dockerfile ]]; then
+		log_debug "custom_dockerfile_needed=false"
+		log_debug "custom_dockerfile_reason=user_provided_dockerfile"
+	elif [[ $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
+		log_debug "custom_dockerfile_needed=true"
 		log_debug "custom_dockerfile_reason=userdocs_with_updates"
 	else
+		log_debug "custom_dockerfile_needed=true"
 		log_debug "custom_dockerfile_reason=standard_image_user_setup_and_updates"
 	fi
 
@@ -829,8 +848,8 @@ _env_info() {
 
 to_gh_env() {
 	local env_var="$1"
-	# Use centralized validation
-	if ! ( validate_input "$env_var" "env_var" 2> /dev/null ); then
+	# Use centralized validation without subshell fork
+	if ! check_env_var "$env_var"; then
 		log_error "Security: Invalid environment variable for GitHub ENV: $env_var"
 		return 1
 	fi
@@ -839,8 +858,8 @@ to_gh_env() {
 
 to_gh_output() {
 	local output_var="$1"
-	# Use centralized validation
-	if ! ( validate_input "$output_var" "env_var" 2> /dev/null ); then
+	# Use centralized validation without subshell fork
+	if ! check_env_var "$output_var"; then
 		log_error "Security: Invalid output variable for GitHub OUTPUT: $output_var"
 		return 1
 	fi
@@ -897,6 +916,21 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 			exit 1
 		fi
 
+		# If the Dockerfile has a WORKDIR set, grab the last path and set it to wd before expanding custom commands
+		extracted_wd=$(grep -E '^[[:space:]]*WORKDIR[[:space:]]+' "$dockerfile_path" | tail -1 | sed -E 's/^[[:space:]]*WORKDIR[[:space:]]+//; s/[[:space:]\r]+$//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/')
+		if [[ -n $extracted_wd ]]; then
+			# Validate extracted workdir for security
+			if [[ $extracted_wd =~ ^[a-zA-Z0-9/_.-]+$ ]] && [[ ${#extracted_wd} -le 256 ]]; then
+				wd="$extracted_wd"
+				if [[ -n $inputs_custom_docker_commands ]]; then
+					parse_docker_commands
+				fi
+			else
+				# Log warning about invalid WORKDIR (but continue with default)
+				log_warn "Security: Invalid WORKDIR path found in Dockerfile, using default: $extracted_wd"
+			fi
+		fi
+
 		# Write Dockerfile to the step summary for visibility
 		log_info "Using Dockerfile: $dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
 		{
@@ -925,19 +959,6 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 			rm -f "$dockerfile_path"
 			exit 1
 		}
-
-		# if the dockerfile has a WORKDIR set grab the path and set it to wd or we have no idea what it is.
-		# Use safe parsing to prevent command injection
-		extracted_wd=$(grep -E '^[[:space:]]*WORKDIR[[:space:]]+' "$dockerfile_path" | tail -1 | sed -E 's/^[[:space:]]*WORKDIR[[:space:]]+//' || echo "")
-		if [[ -n $extracted_wd ]]; then
-			# Validate extracted workdir for security
-			if [[ $extracted_wd =~ ^[a-zA-Z0-9/_.-]+$ ]] && [[ ${#extracted_wd} -le 256 ]]; then
-				wd="$extracted_wd"
-			else
-				# Log warning about invalid WORKDIR (but continue with default)
-				log_warn "Security: Invalid WORKDIR path found in Dockerfile, using default: $extracted_wd"
-			fi
-		fi
 
 		# Clean up the temporary Dockerfile and emit minimal outputs
 		rm -f "$dockerfile_path"
@@ -1036,9 +1057,8 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 	docker build --platform "$inputs_platform" -f "$dockerfile_path" -t "$custom_image_tag" . || {
 		log_error "Failed to build Docker image for platform $inputs_platform"
 		log_error "Base image: ${inputs_os_id}:${inputs_os_version_id}"
-
-		log_error "Failed to build for platform $inputs_platform"
 		log_error "This could be due to: unsupported platform, missing emulation, or registry issues"
+		rm -f "$dockerfile_path"
 		exit 1
 	}
 
