@@ -173,6 +173,14 @@ assert_output "Fastest mirror selected (ftp.snt.utwente.nl)" "ftp.snt.utwente.nl
 assert_output "Preferred mirror accepted when accessible" "ftp.gnu.org" \
 	"$simple_source" "https://ftp.gnu.org/gnu"
 
+# Preferred mirror: if unavailable (404), fall back to fastest mirror in source_urls
+assert_output "Unreachable preferred mirror falls back to fastest mirror" "ftp.snt.utwente.nl" \
+	"$simple_source" "http://mirrors.kernel.org/gnu"
+
+# Malformed http/https URL format → exit 4
+run_test "Malformed http/https mirror URL exits 4" 4 \
+	"$simple_source" "https://-invalid-host"
+
 # URL not starting with http/https is treated as an unknown version token → exit 3
 run_test "Non-URL argument exits 3" 3 \
 	"$simple_source" "not-a-url"
@@ -204,9 +212,62 @@ assert_not_output "No DEBUG output without -vv" "\[DEBUG\]" \
 assert_output "-v with gcc still outputs version" "14\.1\.0" \
 	"$simple_source" -v gcc
 
-section "Exit Codes (network-error propagation)"
+section "Fallback & Exit Codes"
 
-# Simulate total network failure: curl always fails
+# Simulate sourceware.org failure with working mirrorservice.org fallback
+cat > "$tmp_dir/curl" << 'FALLBACKEOF'
+#!/bin/bash
+args="$*"
+case "$args" in
+	*"mirrorservice.org/sites/sourceware.org/pub/gcc/releases"*)
+		printf '<a href="gcc-14.2.0/">gcc-14.2.0/</a>\n'
+		exit 0
+		;;
+	*"mirrorservice.org/sites/sourceware.org/pub/binutils/releases"*)
+		printf '<a href="binutils-2.44.tar.xz">binutils-2.44.tar.xz</a>\n'
+		exit 0
+		;;
+	*"sourceware.org"*)
+		exit 1
+		;;
+	*)
+		exit 1
+		;;
+esac
+FALLBACKEOF
+chmod +x "$tmp_dir/curl"
+
+assert_output "Falls back to mirrorservice.org when sourceware.org fails" "14\.2\.0" \
+	"$simple_source" gcc
+
+# Simulate version fetch succeeding, but all mirrors returning 404 → exit 5
+cat > "$tmp_dir/curl" << 'NOMIRROREOF'
+#!/bin/bash
+args="$*"
+case "$args" in
+	*"sourceware.org/pub/gcc/releases"*)
+		printf '<a href="gcc-14.1.0/">gcc-14.1.0/</a>\n'
+		exit 0
+		;;
+	*"sourceware.org/pub/binutils/releases"*)
+		printf '<a href="binutils-2.43.tar.xz">binutils-2.43.tar.xz</a>\n'
+		exit 0
+		;;
+	*"%{http_code}"*|*"-I"*)
+		printf '404'
+		exit 0
+		;;
+	*)
+		exit 1
+		;;
+esac
+NOMIRROREOF
+chmod +x "$tmp_dir/curl"
+
+run_test "No working mirrors available exits 5" 5 \
+	"$simple_source"
+
+# Simulate total network failure: curl always fails → exit 2
 cat > "$tmp_dir/curl" << 'FAILEOF'
 #!/bin/bash
 exit 1

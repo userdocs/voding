@@ -238,6 +238,10 @@ section "Dry Run"
 run_test "Missing patch dir exits 1" 1 \
 	"$patch_verify" "$tmp_dir/nonexistent"
 
+patches_for_bad_repo=$(make_valid_patches_dir "dp-bad-repo")
+run_test "Missing --repo target dir exits 1" 1 \
+	"$patch_verify" -r "$tmp_dir/nonexistent-repo" "$patches_for_bad_repo"
+
 empty_dir="$tmp_dir/empty-patches"
 mkdir -p "$empty_dir"
 run_test "Empty patch dir exits 1" 1 \
@@ -247,6 +251,21 @@ target=$(make_target_dir "dr-valid")
 patches=$(make_valid_patches_dir "dp-valid")
 run_test "All valid patches exits 0" 0 \
 	"$patch_verify" -r "$target" "$patches"
+
+# Default 'patches' directory used when flag is given without positional arg
+def_work=$(make_target_dir "dr-default-dir")
+mkdir -p "$def_work/patches"
+cp "$script_dir/patches/valid.patch" "$def_work/patches/"
+run_test "Default 'patches' directory used when omitted" 0 \
+	bash -c "cd \"$def_work\" && \"$patch_verify\" -d"
+
+# Relative paths for -r, patch_dir, and -s
+make_target_dir "rel-target" > /dev/null
+make_invalid_patches_dir "rel-patches" > /dev/null
+run_test "Relative paths resolved for -r, patch_dir, and -s" 1 \
+	bash -c "cd \"$tmp_dir\" && \"$patch_verify\" -r rel-target rel-patches -s rel-failed.txt"
+assert_file_contains "Relative -s file created in caller dir" \
+	"$tmp_dir/rel-failed.txt" "invalid.patch"
 
 # Dry run must not modify files even when the patch is valid
 target=$(make_target_dir "dr-nomod")
@@ -279,16 +298,15 @@ cp "$script_dir/patches/valid.patch" "$diff_dir/valid.diff"
 run_test ".diff extension recognised" 0 \
 	"$patch_verify" -r "$target" "$diff_dir"
 
-# Verbose output contains failure reason
+# Verbose dry-run preserves multi-line reason; non-verbose truncates to 1 line
 target=$(make_target_dir "dr-verbose")
 patches=$(make_invalid_patches_dir "dp-verbose")
-assert_output "Verbose mode shows Reason on failure" "Reason" \
+assert_output "Verbose dry-run shows multi-line patch error details" "Perhaps you used the wrong -p" \
 	"$patch_verify" -v -r "$target" "$patches"
 
-# Non-verbose error shows only one line (no multi-line reason)
 target=$(make_target_dir "dr-nonverbose")
 patches=$(make_invalid_patches_dir "dp-nonverbose")
-assert_output "Non-verbose shows failure indicator" "Failed" \
+assert_not_output "Non-verbose dry-run truncates multi-line error to first line" "Perhaps you used the wrong -p" \
 	"$patch_verify" -r "$target" "$patches"
 
 section "Dry Run – Output Features"
@@ -383,6 +401,70 @@ patches=$(make_invalid_patches_dir "dp-ap-noverbose-detail")
 assert_not_output "Non-verbose apply failure omits 'Detailed error'" "Detailed error" \
 	"$patch_verify" -a -r "$target" "$patches"
 
+# Multi-hunk patch where hunk 1 passes and hunk 2 fails must not partially modify target
+target=$(make_target_dir "ap-partial")
+partial_patches="$tmp_dir/dp-ap-partial"
+mkdir -p "$partial_patches"
+cat > "$partial_patches/partial.patch" << 'EOF'
+--- a/config.txt
++++ b/config.txt
+@@ -1,2 +1,2 @@
+-# Configuration file
++# Modified header
+ version=1.0
+@@ -3,2 +3,2 @@
+-nonexistent_line=true
++nonexistent_line=false
+ feature_x=enabled
+EOF
+config_before="$(cat "$target/config.txt")"
+run_test "Multi-hunk failing patch exits 1 in apply mode" 1 \
+	"$patch_verify" -a -f -r "$target" "$partial_patches"
+assert_file_unchanged "Multi-hunk failing patch does not partially mutate file" \
+	"$target/config.txt" "$config_before"
+
+# Mixed .diff and .patch ordering: 01.diff must apply before 02.patch
+target=$(make_target_dir "ap-order")
+order_patches="$tmp_dir/dp-ap-order"
+mkdir -p "$order_patches"
+cp "$script_dir/patches/valid.patch" "$order_patches/01-first.diff"
+cat > "$order_patches/02-second.patch" << 'EOF'
+--- a/hello.c
++++ b/hello.c
+@@ -3,6 +3,7 @@
+ int main() {
+ 	printf("Hello World\n");
+ 	printf("Patched successfully!\n");
++	printf("Second patch applied in order!\n");
+ 	return 0;
+ }
+EOF
+run_test "Mixed .diff and .patch applied in lexicographical order" 0 \
+	"$patch_verify" -a -r "$target" "$order_patches"
+assert_file_contains "Dependent second patch applied after first .diff" \
+	"$target/hello.c" "Second patch applied in order!"
+
+# --force (-f) recovers from whitespace differences in non-git target
+target=$(make_target_dir "ap-ws")
+ws_patches="$tmp_dir/dp-ap-ws"
+mkdir -p "$ws_patches"
+cat > "$ws_patches/ws.patch" << 'EOF'
+--- a/hello.c
++++ b/hello.c
+@@ -2,5 +2,6 @@
+ 
+ int main() {
+-    printf("Hello World\n");
++    printf("Hello World\n");
++    printf("Whitespace force applied!\n");
+     return 0;
+ }
+EOF
+run_test "Whitespace mismatch fails without -f in non-git dir" 1 \
+	"$patch_verify" -a -r "$target" "$ws_patches"
+run_test "Whitespace mismatch succeeds with -a -f in non-git dir" 0 \
+	"$patch_verify" -a -f -r "$target" "$ws_patches"
+
 section "Apply Mode – Git Repo"
 
 if command -v git > /dev/null 2>&1; then
@@ -405,6 +487,52 @@ if command -v git > /dev/null 2>&1; then
 	patches=$(make_invalid_patches_dir "git-dp-dryrun-invalid")
 	run_test "git: dry run invalid patch exits 1" 1 \
 		"$patch_verify" -r "$git_repo" "$patches"
+
+	# git: --force (-f) recovers from whitespace mismatch
+	git_ws_repo=$(make_git_repo "git-ws")
+	run_test "git: whitespace mismatch fails without -f" 1 \
+		"$patch_verify" -a -r "$git_ws_repo" "$ws_patches"
+	run_test "git: whitespace mismatch succeeds with -a -f" 0 \
+		"$patch_verify" -a -f -r "$git_ws_repo" "$ws_patches"
+
+	# git: 3-way merge succeeds when context has changed but merge has no conflicts
+	git_3way_repo=$(make_git_repo "git-3way")
+	threeway_patches="$tmp_dir/dp-git-3way"
+	mkdir -p "$threeway_patches"
+	git -C "$git_3way_repo" checkout -q -b patch-branch
+	sed -i 's/feature_x=enabled/feature_x=disabled/' "$git_3way_repo/config.txt"
+	git -C "$git_3way_repo" commit -q -a -m "patch change"
+	git -C "$git_3way_repo" show --format= > "$threeway_patches/3way.patch"
+	git -C "$git_3way_repo" checkout -q -
+	sed -i 's/version=1.0/version=2.0/' "$git_3way_repo/config.txt"
+	git -C "$git_3way_repo" commit -q -a -m "context change"
+	assert_output "git: 3-way merge applies diverged patch cleanly" "Applied with 3-way merge" \
+		"$patch_verify" -a -r "$git_3way_repo" "$threeway_patches"
+
+	# git: conflicting 3-way merge fails without leaving conflict markers
+	git_conflict_repo=$(make_git_repo "git-conflict")
+	conflict_patches="$tmp_dir/dp-git-conflict"
+	mkdir -p "$conflict_patches"
+	git -C "$git_conflict_repo" checkout -q -b conflict-branch
+	sed -i 's/version=1.0/version=2.0/' "$git_conflict_repo/config.txt"
+	git -C "$git_conflict_repo" commit -q -a -m "version 2.0"
+	git -C "$git_conflict_repo" show --format= > "$conflict_patches/conflict.patch"
+	git -C "$git_conflict_repo" checkout -q -
+	sed -i 's/version=1.0/version=3.0/' "$git_conflict_repo/config.txt"
+	git -C "$git_conflict_repo" commit -q -a -m "version 3.0"
+	conflict_before="$(cat "$git_conflict_repo/config.txt")"
+	run_test "git: conflicting 3-way merge exits 1" 1 \
+		"$patch_verify" -a -f -r "$git_conflict_repo" "$conflict_patches"
+	assert_file_unchanged "git: conflicting 3-way merge leaves working tree clean" \
+		"$git_conflict_repo/config.txt" "$conflict_before"
+
+	# git: worktree (.git as a file) is detected as a git repository
+	wt_base=$(make_git_repo "git-wt-base")
+	wt_dir="$tmp_dir/git-wt-linked"
+	git -C "$wt_base" worktree add -q -b wt-branch "$wt_dir"
+	wt_patches=$(make_valid_patches_dir "git-dp-wt")
+	assert_output "git: worktree (.git file) detected as git repository" "Target git repository" \
+		"$patch_verify" -r "$wt_dir" "$wt_patches"
 else
 	printf '\n  (skipping git tests: git not available)\n'
 fi
