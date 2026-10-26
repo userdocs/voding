@@ -492,7 +492,7 @@ main() {
 	download "$url" "$tmp_path"
 
 	# Set executable permissions
-	print_action "Setting executable permissions for: $tmp_path"
+	print_action "Setting executable permissions for: $install_path"
 	chmod 755 "$tmp_path" || {
 		handle_error $? "chmod 755 $tmp_path" "Failed to set executable permissions"
 	}

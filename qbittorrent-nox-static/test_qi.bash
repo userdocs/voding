@@ -1020,6 +1020,8 @@ test_install_success() {
 	assert_contains "reports verification" "$err" "GitHub API SHA256 verification passed"
 	assert_contains "reports binary version" "$err" "Version: qBittorrent v9.9.9"
 	assert_contains "reports success" "$err" "Installation completed successfully!"
+	assert_not_contains "temp file name is never shown to the user" "$err" ".qbittorrent-nox."
+	assert_contains "permissions message names the final path" "$err" "Setting executable permissions for: $sb/home/bin/qbittorrent-nox"
 }
 
 test_install_shows_resolved_libtorrent_version() {
