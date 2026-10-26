@@ -95,9 +95,9 @@ print_output() {
 	if [[ $message == *:* ]]; then
 		local prefix="${message%%:*}:"
 		local suffix="${message#*: }"
-		printf '%b\n' "$color $icon $prefix ${color}$suffix $COLOR_RESET"
+		printf '%b\n' "$color $icon $prefix ${color}$suffix $COLOR_RESET" >&2
 	else
-		printf '%b\n' "$color $icon $message"
+		printf '%b\n' "$color $icon $message" >&2
 	fi
 }
 
@@ -170,6 +170,25 @@ detect_arch() {
 	esac
 }
 
+# Validate an architecture name against the published binaries
+validate_arch() {
+	case "$1" in
+		x86_64 | x86 | aarch64 | armv7 | armhf | riscv64) return 0 ;;
+		*)
+			print_error "Unsupported architecture: $1"
+			print_error "Supported architectures: x86_64, x86, aarch64, armv7, armhf, riscv64"
+			return 1
+			;;
+	esac
+}
+
+# Remove the temporary download if the script exits before installing it
+cleanup_tmp() {
+	if [[ -n ${tmp_path:-} ]]; then
+		rm -f -- "$tmp_path"
+	fi
+}
+
 # Check for wget or curl, default to curl if present
 check_download_tools() {
 	if command -v curl > /dev/null 2>&1; then
@@ -221,6 +240,7 @@ create_sha256() {
 
 # Comprehensive SHA256 verification function
 # Tries GitHub CLI first, then API, then shows local SHA as fallback
+# Returns 0 verified, 1 could not verify, 2 checksum mismatch
 verify_binary_integrity() {
 	local install_path="$1"
 	local release_tag="$2"
@@ -259,7 +279,7 @@ verify_binary_integrity() {
 	# Try GitHub API verification as fallback
 	local api_url="https://api.github.com/repos/${repo}/releases/tags/${release_tag}"
 	local tool
-	tool=$(check_download_tools)
+	tool=$(check_download_tools) || exit 1
 
 	print_action "Verifying SHA256 against GitHub API..."
 
@@ -294,8 +314,8 @@ verify_binary_integrity() {
 		# Use jq if available (preferred method) - extract just the hash value
 		api_digests=$(printf '%s' "$api_response" | jq -r '.assets[].digest // empty' 2> /dev/null | sed 's/^sha256://')
 	else
-		# Fall back to sed if jq is not available - extract just the hash value
-		api_digests=$(printf '%s' "$api_response" | sed -rn 's|(.*)sha256:([^"]*)".*|\2|p' 2> /dev/null)
+		# Fall back to grep if jq is not available - works on single-line and pretty-printed JSON
+		api_digests=$(printf '%s' "$api_response" | grep -Eo 'sha256:[0-9a-f]{64}' 2> /dev/null | sed 's/^sha256://')
 	fi
 
 	if [[ -z $api_digests ]]; then
@@ -327,8 +347,7 @@ verify_binary_integrity() {
 			fi
 		done <<< "$api_digests"
 		print_warning "This may indicate a corrupted download or outdated API data"
-		print_info "Local SHA256 verification completed"
-		return 1
+		return 2
 	fi
 }
 # Get release tag from API
@@ -336,7 +355,7 @@ get_release_tag() {
 	local api="https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/dependency-version.json"
 	local ver="${LIBTORRENT_VERSION:-v2}"
 	local tool
-	tool=$(check_download_tools)
+	tool=$(check_download_tools) || exit 1
 
 	# Fetch API response
 	local response
@@ -360,22 +379,21 @@ get_release_tag() {
 	fi
 
 	# Parse release tag
-	local qbt_ver libt_ver
+	local qbt_ver libt_ver json_key
 	qbt_ver=$(printf '%s' "$response" | sed -rn 's|(.*)"qbittorrent": "(.*)",|\2|p')
 
+	# v1 and v2 are kept as aliases for 1.2 and 2.0
 	case "$ver" in
-		v1)
-			libt_ver=$(printf '%s' "$response" | sed -rn 's|(.*)"libtorrent_1_2": "(.*)",|\2|p')
-			;;
-		v2)
-			libt_ver=$(printf '%s' "$response" | sed -rn 's|(.*)"libtorrent_2_0": "(.*)",|\2|p')
-			;;
+		v1 | 1.2) json_key="libtorrent_1_2" ;;
+		v2 | 2.0) json_key="libtorrent_2_0" ;;
+		v2.1 | 2.1) json_key="libtorrent_2_1" ;;
 		*)
 			print_error "Invalid LibTorrent version: $ver"
-			print_error "Valid options: v1, v2"
+			print_error "Valid options: 1.2 (v1), 2.0 (v2), 2.1"
 			exit 1
 			;;
 	esac
+	libt_ver=$(printf '%s' "$response" | sed -rn "s|(.*)\"${json_key}\": \"(.*)\",|\2|p")
 
 	if [[ -z $qbt_ver ]] || [[ -z $libt_ver ]]; then
 		print_error "Failed to parse version information from API response"
@@ -400,7 +418,7 @@ download() {
 	local url="$1"
 	local output="$2"
 	local tool
-	tool=$(check_download_tools)
+	tool=$(check_download_tools) || exit 1
 
 	print_action "Downloading: $url"
 	case "$tool" in
@@ -433,13 +451,19 @@ main() {
 	print_info "qBittorrent-nox Static Binary Installer"
 	print_generic "======================================="
 
-	local arch="${FORCE_ARCH:-$(detect_arch)}"
+	# exit inside $(...) only ends the subshell, so check each capture
+	local arch="${FORCE_ARCH:-}"
+	if [[ -z $arch ]]; then
+		arch=$(detect_arch) || exit 1
+	else
+		validate_arch "$arch" || exit 1
+	fi
 	local libtorrent_ver="${LIBTORRENT_VERSION:-v2}"
 	local install_path="$HOME/bin/qbittorrent-nox"
 	# Get release and download
-	local release_tag revision
-	# Capture release tag and revision from get_release_tag
-	read release_tag revision <<< "$(get_release_tag)"
+	local release_tag revision release_info
+	release_info=$(get_release_tag) || exit 1
+	read -r release_tag revision <<< "$release_info"
 
 	print_info "Architecture: $arch"
 	print_info "LibTorrent version: $libtorrent_ver"
@@ -459,22 +483,35 @@ main() {
 	local url
 	url=$(create_download_url "$arch" "$release_tag")
 
-	# Download and install binary
-	download "$url" "$install_path"
+	# Download to a temp file so a failed download never clobbers a working install
+	tmp_path=$(mktemp "$HOME/bin/.qbittorrent-nox.XXXXXX") || {
+		handle_error $? "mktemp $HOME/bin/.qbittorrent-nox.XXXXXX" "Failed to create temporary file"
+	}
+	trap cleanup_tmp EXIT
+	download "$url" "$tmp_path"
 
 	# Set executable permissions
-	print_action "Setting executable permissions for: $install_path"
-	chmod 755 "$install_path" || {
-		handle_error $? "chmod 755 $install_path" "Failed to set executable permissions"
+	print_action "Setting executable permissions for: $tmp_path"
+	chmod 755 "$tmp_path" || {
+		handle_error $? "chmod 755 $tmp_path" "Failed to set executable permissions"
 	}
 
-	print_success "Installation complete: $install_path"
-
-	# Verify binary integrity (SHA256 + attestations)
-	local integrity_failed=false
-	if ! verify_binary_integrity "$install_path" "$release_tag" "$arch"; then
+	# Verify binary integrity (SHA256 + attestations) before installing
+	local integrity_failed=false integrity_rc=0
+	verify_binary_integrity "$tmp_path" "$release_tag" "$arch" || integrity_rc=$?
+	if [[ $integrity_rc -eq 2 ]]; then
+		print_failure "Checksum mismatch: refusing to install the downloaded binary"
+		exit 1
+	elif [[ $integrity_rc -ne 0 ]]; then
 		integrity_failed=true
 	fi
+
+	mv -f "$tmp_path" "$install_path" || {
+		handle_error $? "mv -f $tmp_path $install_path" "Failed to install binary"
+	}
+	tmp_path=""
+
+	print_success "Installation complete: $install_path"
 
 	# Test binary
 	local test_output test_exit_code binary_failed=false
@@ -514,7 +551,7 @@ main() {
 			print_info "Binary test failed - the application may not work properly"
 		fi
 		if [[ $integrity_failed == true ]]; then
-			print_info "Integrity verification failed - consider re-downloading"
+			print_info "Integrity could not be verified - consider verifying manually"
 		fi
 	else
 		print_success "Installation completed successfully!"
@@ -532,19 +569,20 @@ while [[ $# -gt 0 ]]; do
 
 				Options:
 
-				  -lt | --libtorrent VER   LibTorrent version (v1, v2) [default: v2]
+				  -lt | --libtorrent VER   LibTorrent version (1.2 | v1, 2.0 | v2, 2.1) [default: v2]
 				  -fa | --force-arch ARCH  Force architecture (x86_64, x86, aarch64, armv7, armhf, riscv64) [ENV: FORCE_ARCH]
 				  --help                   Show this help
 
 				Environment Variables:
 
-				  LIBTORRENT_VERSION       LibTorrent version (v1, v2) [default: v2]
+				  LIBTORRENT_VERSION       LibTorrent version (1.2 | v1, 2.0 | v2, 2.1) [default: v2]
 				  FORCE_ARCH               Force architecture (x86_64, x86, aarch64, armv7, armhf, riscv64)
 
 				Examples:
 
-				  ./qi.bash                # Install with LibTorrent v2
-				  ./qi.bash -lt v1         # Install with LibTorrent v1
+				  ./qi.bash                # Install with LibTorrent 2.0
+				  ./qi.bash -lt 1.2        # Install with LibTorrent 1.2
+				  ./qi.bash -lt 2.1        # Install with LibTorrent 2.1
 				  ./qi.bash -fa armv7      # Force armv7 architecture
 
 			EOF
@@ -553,15 +591,19 @@ while [[ $# -gt 0 ]]; do
 		-lt | --libtorrent)
 			shift
 			case "$1" in
-				v1 | v2) LIBTORRENT_VERSION="$1" ;;
+				v1 | v2 | 1.2 | 2.0 | 2.1 | v2.1) LIBTORRENT_VERSION="$1" ;;
 				*)
-					print_error "Invalid libtorrent version: $1. Use: v1 or v2"
+					print_error "Invalid libtorrent version: $1. Use: 1.2 (v1), 2.0 (v2) or 2.1"
 					exit 1
 					;;
 			esac
 			;;
 		-fa | --force-arch)
 			shift
+			if [[ -z ${1:-} ]]; then
+				print_error "Option -fa requires an architecture. Use -h or --help for usage"
+				exit 1
+			fi
 			FORCE_ARCH="$1"
 			;;
 		*)
