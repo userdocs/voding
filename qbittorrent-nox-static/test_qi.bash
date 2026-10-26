@@ -598,7 +598,7 @@ test_unit_check_supported_distro() {
 
 test_unit_get_release_tag_versions() {
 	local pair
-	for pair in 1.2:$tag_12 v1:$tag_12 2.0:$tag_20 v2:$tag_20 2.1:$tag_21 v2.1:$tag_21; do
+	for pair in 1.2:$tag_12 v1:$tag_12 v1.2:$tag_12 2.0:$tag_20 v2.0:$tag_20 2.1:$tag_21 v2:$tag_21 v2.1:$tag_21; do
 		qi_env=("LIBTORRENT_VERSION=${pair%%:*}")
 		run_lib get_release_tag
 		assert_eq "tag for ${pair%%:*}" "${pair#*:} 0" "$out"
@@ -608,7 +608,10 @@ test_unit_get_release_tag_versions() {
 
 test_unit_get_release_tag_default_is_v2() {
 	run_lib get_release_tag
-	assert_eq "default maps to libtorrent 2.0" "$tag_20 0" "$out"
+	assert_eq "default maps to libtorrent 2.1" "$tag_21 0" "$out"
+	qi_env=("LIBTORRENT_VERSION=v2")
+	run_lib get_release_tag
+	assert_eq "v2 maps to libtorrent 2.1" "$tag_21 0" "$out"
 }
 
 test_unit_get_release_tag_with_wget() {
@@ -622,7 +625,7 @@ test_unit_get_release_tag_with_wget() {
 
 test_unit_get_release_tag_invalid_version() {
 	local ver
-	for ver in v1.2 2 2.1.2 latest 1_2 v3 3.0; do
+	for ver in 2 2.1.2 latest 1_2 v3 3.0 v2.2 1.1 V2; do
 		qi_env=("LIBTORRENT_VERSION=$ver")
 		run_lib get_release_tag
 		assert_rc "rejects [$ver]" 1
@@ -654,12 +657,12 @@ test_unit_get_release_tag_revision() {
 	release_revision=7
 	write_release_json
 	run_lib get_release_tag
-	assert_eq "revision is returned" "$tag_20 7" "$out"
+	assert_eq "revision is returned" "$tag_21 7" "$out"
 
 	write_release_json revision
 	run_lib get_release_tag
 	assert_rc "missing revision is not fatal" 0
-	assert_eq "stdout holds only the tag" "$tag_20 " "$out"
+	assert_eq "stdout holds only the tag" "$tag_21 " "$out"
 	assert_contains "warns about the revision" "$err" "Failed to parse revision"
 }
 
@@ -875,7 +878,7 @@ test_cli_libtorrent_validation() {
 
 test_cli_libtorrent_selection() {
 	local pair ver tag
-	for pair in 1.2:$tag_12 v1:$tag_12 2.0:$tag_20 v2:$tag_20 2.1:$tag_21 v2.1:$tag_21; do
+	for pair in 1.2:$tag_12 v1:$tag_12 v1.2:$tag_12 2.0:$tag_20 v2.0:$tag_20 2.1:$tag_21 v2:$tag_21 v2.1:$tag_21; do
 		ver="${pair%%:*}"
 		tag="${pair#*:}"
 		rm -rf "$sb/home/bin"
@@ -897,15 +900,15 @@ test_cli_libtorrent_env_and_precedence() {
 
 	rm -rf "$sb/home/bin"
 	: > "$sb/mock/calls.log"
-	run_qi -lt 2.1
-	assert_called "flag overrides env" "$tag_21/x86_64-qbittorrent-nox"
+	run_qi -lt 2.0
+	assert_called "flag overrides env" "$tag_20/x86_64-qbittorrent-nox"
 	assert_not_called "env value unused" "$tag_12"
 
 	: > "$sb/mock/calls.log"
 	qi_env=()
 	rm -rf "$sb/home/bin"
 	run_qi
-	assert_called "default is libtorrent 2.0" "$tag_20/x86_64-qbittorrent-nox"
+	assert_called "default is libtorrent 2.1" "$tag_21/x86_64-qbittorrent-nox"
 }
 
 test_cli_invalid_env_libtorrent_aborts() {
@@ -925,7 +928,7 @@ test_cli_force_arch() {
 		: > "$sb/mock/calls.log"
 		run_qi -fa "$arch"
 		assert_rc "-fa $arch exits 0" 0
-		assert_called "-fa $arch URL" "$tag_20/$arch-qbittorrent-nox"
+		assert_called "-fa $arch URL" "$tag_21/$arch-qbittorrent-nox"
 	done
 	rm -rf "$sb/home/bin"
 	: > "$sb/mock/calls.log"
@@ -974,7 +977,7 @@ test_install_arch_detection() {
 		rm -rf "$sb/home/bin"
 		: > "$sb/mock/calls.log"
 		run_qi
-		assert_called "dpkg ${pair%%:*} downloads ${pair#*:}" "$tag_20/${pair#*:}-qbittorrent-nox"
+		assert_called "dpkg ${pair%%:*} downloads ${pair#*:}" "$tag_21/${pair#*:}-qbittorrent-nox"
 	done
 
 	remove_tool dpkg
@@ -984,7 +987,7 @@ test_install_arch_detection() {
 	: > "$sb/mock/calls.log"
 	run_qi
 	assert_rc "alpine armhf exits 0" 0
-	assert_called "alpine armhf keeps armhf binary" "$tag_20/armhf-qbittorrent-nox"
+	assert_called "alpine armhf keeps armhf binary" "$tag_21/armhf-qbittorrent-nox"
 }
 
 test_install_undetectable_arch_aborts() {
@@ -1011,11 +1014,21 @@ test_install_success() {
 	assert_same_file "content matches download" "$sb/home/bin/qbittorrent-nox" "$sb/mock/binary"
 	assert_eq "no temp files left behind" "qbittorrent-nox" "$(bin_listing)"
 	assert_contains "reports arch" "$err" "Architecture: x86_64"
-	assert_contains "reports libtorrent" "$err" "LibTorrent version: v2"
+	assert_contains "reports resolved libtorrent version" "$err" "LibTorrent version: 2.1.2"
+	assert_not_contains "does not echo the raw alias" "$err" "LibTorrent version: v2"
 	assert_contains "reports revision" "$err" "Build revision: 0"
 	assert_contains "reports verification" "$err" "GitHub API SHA256 verification passed"
 	assert_contains "reports binary version" "$err" "Version: qBittorrent v9.9.9"
 	assert_contains "reports success" "$err" "Installation completed successfully!"
+}
+
+test_install_shows_resolved_libtorrent_version() {
+	local pair
+	for pair in v1:1.2.20 1.2:1.2.20 v2.0:2.0.15 2.0:2.0.15 v2:2.1.2 2.1:2.1.2; do
+		rm -rf "$sb/home/bin"
+		run_qi -lt "${pair%%:*}"
+		assert_contains "-lt ${pair%%:*} shows ${pair#*:}" "$err" "LibTorrent version: ${pair#*:}"
+	done
 }
 
 test_install_creates_bin_dir() {
@@ -1047,7 +1060,7 @@ test_install_with_wget() {
 	assert_rc "exits 0" 0
 	assert_same_file "installed via wget" "$sb/home/bin/qbittorrent-nox" "$sb/mock/binary"
 	assert_not_called "curl never used" "curl "
-	assert_called "wget downloaded the binary" "wget $release_base/$tag_20/x86_64-qbittorrent-nox"
+	assert_called "wget downloaded the binary" "wget $release_base/$tag_21/x86_64-qbittorrent-nox"
 }
 
 test_install_no_download_tool() {

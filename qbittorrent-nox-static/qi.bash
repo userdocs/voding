@@ -382,14 +382,14 @@ get_release_tag() {
 	local qbt_ver libt_ver json_key
 	qbt_ver=$(printf '%s' "$response" | sed -rn 's|(.*)"qbittorrent": "(.*)",|\2|p')
 
-	# v1 and v2 are kept as aliases for 1.2 and 2.0
+	# v1 = 1.2, v2 = 2.1 (default), 2.0 must be requested explicitly
 	case "$ver" in
-		v1 | 1.2) json_key="libtorrent_1_2" ;;
-		v2 | 2.0) json_key="libtorrent_2_0" ;;
-		v2.1 | 2.1) json_key="libtorrent_2_1" ;;
+		v1 | v1.2 | 1.2) json_key="libtorrent_1_2" ;;
+		v2.0 | 2.0) json_key="libtorrent_2_0" ;;
+		v2 | v2.1 | 2.1) json_key="libtorrent_2_1" ;;
 		*)
 			print_error "Invalid LibTorrent version: $ver"
-			print_error "Valid options: 1.2 (v1), 2.0 (v2), 2.1"
+			print_error "Valid options: v1/v1.2/1.2, v2.0/2.0, v2/v2.1/2.1"
 			exit 1
 			;;
 	esac
@@ -458,12 +458,13 @@ main() {
 	else
 		validate_arch "$arch" || exit 1
 	fi
-	local libtorrent_ver="${LIBTORRENT_VERSION:-v2}"
 	local install_path="$HOME/bin/qbittorrent-nox"
 	# Get release and download
-	local release_tag revision release_info
+	local release_tag revision release_info libtorrent_ver
 	release_info=$(get_release_tag) || exit 1
 	read -r release_tag revision <<< "$release_info"
+	# Resolved version from the tag, e.g. release-5.3.0_v2.1.2 -> 2.1.2
+	libtorrent_ver="${release_tag##*_v}"
 
 	print_info "Architecture: $arch"
 	print_info "LibTorrent version: $libtorrent_ver"
@@ -569,20 +570,20 @@ while [[ $# -gt 0 ]]; do
 
 				Options:
 
-				  -lt | --libtorrent VER   LibTorrent version (1.2 | v1, 2.0 | v2, 2.1) [default: v2]
+				  -lt | --libtorrent VER   LibTorrent version (v1/v1.2/1.2, v2.0/2.0, v2/v2.1/2.1) [default: v2]
 				  -fa | --force-arch ARCH  Force architecture (x86_64, x86, aarch64, armv7, armhf, riscv64) [ENV: FORCE_ARCH]
 				  --help                   Show this help
 
 				Environment Variables:
 
-				  LIBTORRENT_VERSION       LibTorrent version (1.2 | v1, 2.0 | v2, 2.1) [default: v2]
+				  LIBTORRENT_VERSION       LibTorrent version (v1/v1.2/1.2, v2.0/2.0, v2/v2.1/2.1) [default: v2]
 				  FORCE_ARCH               Force architecture (x86_64, x86, aarch64, armv7, armhf, riscv64)
 
 				Examples:
 
-				  ./qi.bash                # Install with LibTorrent 2.0
-				  ./qi.bash -lt 1.2        # Install with LibTorrent 1.2
-				  ./qi.bash -lt 2.1        # Install with LibTorrent 2.1
+				  ./qi.bash                # Install with LibTorrent 2.1 (v2)
+				  ./qi.bash -lt v1         # Install with LibTorrent 1.2
+				  ./qi.bash -lt 2.0        # Install with LibTorrent 2.0
 				  ./qi.bash -fa armv7      # Force armv7 architecture
 
 			EOF
@@ -591,9 +592,9 @@ while [[ $# -gt 0 ]]; do
 		-lt | --libtorrent)
 			shift
 			case "$1" in
-				v1 | v2 | 1.2 | 2.0 | 2.1 | v2.1) LIBTORRENT_VERSION="$1" ;;
+				v1 | v1.2 | 1.2 | v2.0 | 2.0 | v2 | v2.1 | 2.1) LIBTORRENT_VERSION="$1" ;;
 				*)
-					print_error "Invalid libtorrent version: $1. Use: 1.2 (v1), 2.0 (v2) or 2.1"
+					print_error "Invalid libtorrent version: $1. Use: v1/v1.2/1.2, v2.0/2.0 or v2/v2.1/2.1"
 					exit 1
 					;;
 			esac
