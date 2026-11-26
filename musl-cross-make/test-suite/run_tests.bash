@@ -60,7 +60,7 @@ assert_output() {
 	printf '\n[%d] %s\n' "$total_tests" "$name"
 	local out
 	out=$("$@" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
-	if printf '%s' "$out" | grep -q "$pattern"; then
+	if printf '%s' "$out" | grep -q -- "$pattern"; then
 		_pass
 	else
 		_fail "output did not contain: $pattern"
@@ -76,7 +76,7 @@ assert_not_output() {
 	printf '\n[%d] %s\n' "$total_tests" "$name"
 	local out
 	out=$("$@" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
-	if printf '%s' "$out" | grep -q "$pattern"; then
+	if printf '%s' "$out" | grep -q -- "$pattern"; then
 		_fail "output unexpectedly contained: $pattern"
 	else
 		_pass
@@ -90,7 +90,7 @@ assert_file_contains() {
 	local pattern="$3"
 	((total_tests++))
 	printf '\n[%d] %s\n' "$total_tests" "$name"
-	if [[ -f $file ]] && grep -q "$pattern" "$file"; then
+	if [[ -f $file ]] && grep -q -- "$pattern" "$file"; then
 		_pass
 	else
 		_fail "file '$file' does not contain: $pattern"
@@ -556,6 +556,167 @@ section "Source Guard"
 # After sourcing, apply_patches function must be defined (proves exit was not called)
 run_test "Sourcing defines apply_patches function" 0 \
 	bash -c "source \"$patch_verify\" && declare -f apply_patches > /dev/null"
+
+section "Hardening, Security & Regression Tests"
+
+# Static syntax check
+run_test "bash -n syntax check on patch_verify" 0 \
+	bash -n "$patch_verify"
+
+# Shellcheck check (if installed)
+if command -v shellcheck > /dev/null 2>&1; then
+	run_test "shellcheck clean on patch_verify and run_tests.bash" 0 \
+		shellcheck -s bash "$patch_verify" "${BASH_SOURCE[0]}"
+fi
+
+# Invalid boolean argument to apply_patches fails cleanly
+run_test "apply_patches rejects invalid boolean parameter" 1 \
+	bash -c "source \"$patch_verify\" && apply_patches \"$cwd_patches\" invalid_bool false false \"$cwd_target\" '' false"
+
+# Path traversal ('..') in patch headers is blocked in both dry-run and apply modes
+trav_target=$(make_target_dir "trav-target")
+trav_patches="$tmp_dir/dp-trav"
+mkdir -p "$trav_patches"
+printf 'safe' > "$tmp_dir/outside_victim.txt"
+cat > "$trav_patches/traversal.patch" << 'EOF'
+--- a/../outside_victim.txt
++++ b/../outside_victim.txt
+@@ -1 +1 @@
+-safe
++pwned
+EOF
+run_test "Path traversal patch blocked in dry-run mode" 1 \
+	"$patch_verify" -r "$trav_target" "$trav_patches"
+run_test "Path traversal patch blocked in apply mode" 1 \
+	"$patch_verify" -a -r "$trav_target" "$trav_patches"
+assert_file_unchanged "Outside file untouched by traversal patch" \
+	"$tmp_dir/outside_victim.txt" "safe"
+
+# Missing 'patch' command must exit 1 and MUST NOT delete patches when -x is passed
+nopatch_target=$(make_target_dir "nopatch-target")
+nopatch_dir=$(make_valid_patches_dir "dp-nopatch")
+empty_bin="$tmp_dir/empty-bin"
+mkdir -p "$empty_bin"
+ln -sf "$(command -v bash)" "$empty_bin/bash"
+ln -sf "$(command -v grep)" "$empty_bin/grep"
+run_test "Missing patch binary exits 1 cleanly" 1 \
+	env PATH="$empty_bin" "$empty_bin/bash" "$patch_verify" -x -r "$nopatch_target" "$nopatch_dir"
+assert_file_exists "Missing patch binary with -x does NOT delete patches" \
+	"$nopatch_dir/valid.patch"
+
+# Dry-run with -f (--force) matches apply -f for whitespace-mismatch patches (non-git)
+ws_dr_target=$(make_target_dir "dr-ws-force")
+run_test "Dry-run with -f accepts whitespace-mismatch patch (non-git)" 0 \
+	"$patch_verify" -d -f -r "$ws_dr_target" "$ws_patches"
+
+# Applying with -f in non-git dir does not leave .orig backup files behind
+assert_file_absent "Non-git -a -f leaves no .orig backup file behind" \
+	"$target/hello.c.orig"
+
+# Stale --save-failed file is removed when a subsequent run has 0 failures
+stale_target=$(make_target_dir "sf-stale")
+stale_patches=$(make_valid_patches_dir "dp-sf-stale")
+stale_file="$tmp_dir/stale-failed.txt"
+printf 'old_failure.patch\n' > "$stale_file"
+run_test "Run with pre-existing save-failed file and all valid patches exits 0" 0 \
+	"$patch_verify" -r "$stale_target" "$stale_patches" -s "$stale_file"
+assert_file_absent "Stale --save-failed file removed when all patches succeed" \
+	"$stale_file"
+
+# Combined short flags (-avf), --repo=DIR, --save-failed=FILE, and -- end-of-options
+combo_target=$(make_target_dir "combo-target")
+combo_patches="$tmp_dir/dp-combo"
+mkdir -p "$combo_patches"
+cp "$ws_patches/ws.patch" "$combo_patches/"
+run_test "Combined short flags -avf and --repo= apply whitespace patch" 0 \
+	"$patch_verify" -avf --repo="$combo_target" -- "$combo_patches"
+
+combo_fail_file="$tmp_dir/combo-failed.txt"
+combo_inv_patches=$(make_invalid_patches_dir "dp-combo-inv")
+run_test "--save-failed=FILE syntax records failed patch" 1 \
+	"$patch_verify" --repo="$combo_target" --save-failed="$combo_fail_file" "$combo_inv_patches"
+assert_file_contains "--save-failed=FILE wrote failed patch basename" \
+	"$combo_fail_file" "^invalid\.patch$"
+
+run_test "Invalid flag inside combined short cluster exits 1" 1 \
+	"$patch_verify" -az "$combo_patches"
+
+if command -v git > /dev/null 2>&1; then
+	# Git dry-run with -f accepts whitespace-mismatch patch and 3-way mergeable patch
+	git_dr_ws=$(make_git_repo "git-dr-ws")
+	run_test "git: dry-run with -f accepts whitespace-mismatch patch" 0 \
+		"$patch_verify" -d -f -r "$git_dr_ws" "$ws_patches"
+
+	git_dr_3way=$(make_git_repo "git-dr-3way")
+	git -C "$git_dr_3way" checkout -q -b dr-patch-branch
+	sed -i 's/feature_x=enabled/feature_x=disabled/' "$git_dr_3way/config.txt"
+	git -C "$git_dr_3way" commit -q -a -m "patch change"
+	dr_3way_patches="$tmp_dir/dp-git-dr-3way"
+	mkdir -p "$dr_3way_patches"
+	git -C "$git_dr_3way" show --format= > "$dr_3way_patches/3way.patch"
+	git -C "$git_dr_3way" checkout -q -
+	sed -i 's/version=1.0/version=2.0/' "$git_dr_3way/config.txt"
+	git -C "$git_dr_3way" commit -q -a -m "context change"
+	dr_3way_before="$(cat "$git_dr_3way/config.txt")"
+	assert_output "git: dry-run recognizes 3-way mergeable patch" "OK (3-way merge)" \
+		"$patch_verify" -d -r "$git_dr_3way" "$dr_3way_patches"
+	assert_file_unchanged "git: dry-run 3-way check does not modify target file" \
+		"$git_dr_3way/config.txt" "$dr_3way_before"
+
+	# Git dry-run on conflicting 3-way patch must ALSO leave working tree untouched
+	run_test "git: dry-run conflicting 3-way merge exits 1" 1 \
+		"$patch_verify" -d -r "$git_conflict_repo" "$conflict_patches"
+	assert_file_unchanged "git: dry-run conflicting 3-way merge leaves working tree clean" \
+		"$git_conflict_repo/config.txt" "$conflict_before"
+
+	# Git failed --3way MUST NOT wipe earlier applied uncommitted patches on the same file
+	git_preserve_repo=$(make_git_repo "git-preserve-prior")
+	preserve_patches="$tmp_dir/dp-git-preserve"
+	mkdir -p "$preserve_patches"
+	git -C "$git_preserve_repo" checkout -q -b bad-3way-branch
+	sed -i 's/version=1.0/version=2.0/' "$git_preserve_repo/config.txt"
+	git -C "$git_preserve_repo" commit -q -a -m "version 2.0"
+	git -C "$git_preserve_repo" show --format= > "$preserve_patches/02-conflict.patch"
+	git -C "$git_preserve_repo" checkout -q -
+	sed -i 's/version=1.0/version=3.0/' "$git_preserve_repo/config.txt"
+	git -C "$git_preserve_repo" commit -q -a -m "version 3.0"
+	cat > "$preserve_patches/01-first.patch" << 'EOF'
+--- a/config.txt
++++ b/config.txt
+@@ -2,3 +2,4 @@
+ version=3.0
+ debug=false
+ feature_x=enabled
++added_by_patch_one=true
+EOF
+	run_test "git: 01-first applies and 02-conflict fails (exits 1)" 1 \
+		"$patch_verify" -a -r "$git_preserve_repo" "$preserve_patches"
+	assert_file_contains "git: failed 02-conflict did NOT wipe 01-first's uncommitted changes" \
+		"$git_preserve_repo/config.txt" "added_by_patch_one=true"
+	assert_not_output "git: failed 02-conflict left no conflict markers in config.txt" \
+		"<<<<<<<" cat "$git_preserve_repo/config.txt"
+
+	# Git multi-file patch where file 1 merges cleanly and file 2 conflicts in --3way must leave BOTH files untouched
+	git_multifile_repo=$(make_git_repo "git-multifile-3way")
+	multifile_patches="$tmp_dir/dp-git-multifile"
+	mkdir -p "$multifile_patches"
+	git -C "$git_multifile_repo" checkout -q -b mf-branch
+	sed -i 's/Hello World/Hello Multi/' "$git_multifile_repo/hello.c"
+	sed -i 's/version=1.0/version=2.0/' "$git_multifile_repo/config.txt"
+	git -C "$git_multifile_repo" commit -q -a -m "multi change"
+	git -C "$git_multifile_repo" show --format= > "$multifile_patches/multifile.patch"
+	git -C "$git_multifile_repo" checkout -q -
+	sed -i 's/version=1.0/version=3.0/' "$git_multifile_repo/config.txt"
+	git -C "$git_multifile_repo" commit -q -a -m "conflicting config change"
+	mf_hello_before="$(cat "$git_multifile_repo/hello.c")"
+	mf_config_before="$(cat "$git_multifile_repo/config.txt")"
+	run_test "git: multi-file partial 3-way conflict exits 1" 1 \
+		"$patch_verify" -a -f -r "$git_multifile_repo" "$multifile_patches"
+	assert_file_unchanged "git: multi-file failed 3-way leaves hello.c untouched" \
+		"$git_multifile_repo/hello.c" "$mf_hello_before"
+	assert_file_unchanged "git: multi-file failed 3-way leaves config.txt untouched" \
+		"$git_multifile_repo/config.txt" "$mf_config_before"
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 

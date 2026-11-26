@@ -3,15 +3,100 @@
 #################################################################################################################################################
 # Global color variables for main script sections
 #################################################################################################################################################
-color_red="\e[31m"
-color_green="\e[32m"
-color_yellow="\e[33m"
-color_blue="\e[34m"
-color_cyan="\e[36m"
-color_magenta="\e[35m"
-color_gray="\e[37m"
-color_end="\e[0m"
-text_bold="\e[1m"
+readonly color_red="\e[31m"
+readonly color_green="\e[32m"
+readonly color_yellow="\e[33m"
+readonly color_blue="\e[34m"
+readonly color_cyan="\e[36m"
+readonly color_magenta="\e[35m"
+readonly color_gray="\e[37m"
+readonly color_end="\e[0m"
+readonly text_bold="\e[1m"
+
+# Check patch headers for '..' path traversal components before invoking git/patch
+patch_has_path_traversal() {
+	local patch_file="$1"
+	grep -qE '^(\+\+\+|---|diff --git )[[:space:]].*(^|[/"[:space:]])\.\.(/|[[:space:]"]|$)' -- "$patch_file" 2> /dev/null
+}
+
+# Attempt git apply --3way transactionally so failed merges (or dry-run checks)
+# never leave conflict markers, partial multi-file changes, or dirty index entries,
+# while preserving any prior uncommitted modifications in the working tree.
+git_try_3way() {
+	local git_repo="$1"
+	local patch_file="$2"
+	local dry_run="$3"
+
+	local -a paths=() existed_paths=() created_paths=()
+	local rec p
+	while IFS= read -r -d '' rec; do
+		if [[ $rec == *$'\t'* ]]; then
+			p="${rec#*$'\t'}"
+			p="${p#*$'\t'}"
+			[[ -n $p ]] && paths+=("$p")
+		elif [[ -n $rec ]]; then
+			paths+=("$rec")
+		fi
+	done < <(git -C "$git_repo" apply --numstat -z -- "$patch_file" 2> /dev/null)
+
+	# If patch cannot be parsed by git apply --numstat, --3way cannot succeed
+	[[ ${#paths[@]} -gt 0 ]] || return 1
+
+	local index_path
+	index_path=$(git -C "$git_repo" rev-parse --git-path index 2> /dev/null) || return 1
+	if [[ $index_path != /* ]]; then
+		index_path="${git_repo}/${index_path}"
+	fi
+
+	local snap_dir
+	snap_dir=$(mktemp -d) || return 1
+
+	if [[ -f $index_path ]]; then
+		cp -pf -- "$index_path" "$snap_dir/index.bak" 2> /dev/null || {
+			rm -rf -- "$snap_dir"
+			return 1
+		}
+	fi
+
+	for p in "${paths[@]}"; do
+		if [[ $p == /* || $p == *..* ]]; then
+			rm -rf -- "$snap_dir"
+			return 1
+		fi
+		if [[ -e "$git_repo/$p" || -L "$git_repo/$p" ]]; then
+			mkdir -p -- "$snap_dir/files/$(dirname "$p")"
+			cp -a -- "$git_repo/$p" "$snap_dir/files/$p" || {
+				rm -rf -- "$snap_dir"
+				return 1
+			}
+			existed_paths+=("$p")
+		else
+			created_paths+=("$p")
+		fi
+	done
+
+	local apply_rc=0
+	git -C "$git_repo" apply --3way -- "$patch_file" > /dev/null 2>&1 || apply_rc=$?
+
+	if [[ $apply_rc -ne 0 || $dry_run == "true" ]]; then
+		if [[ -f "$snap_dir/index.bak" ]]; then
+			cp -pf -- "$snap_dir/index.bak" "$index_path" 2> /dev/null
+		else
+			rm -f -- "$index_path"
+		fi
+		for p in "${created_paths[@]}"; do
+			rm -rf -- "${git_repo:?}/${p:?}"
+		done
+		for p in "${existed_paths[@]}"; do
+			mkdir -p -- "$git_repo/$(dirname "$p")"
+			rm -rf -- "${git_repo:?}/${p:?}"
+			cp -a -- "$snap_dir/files/$p" "$git_repo/$p"
+		done
+	fi
+
+	rm -rf -- "$snap_dir"
+	return "$apply_rc"
+}
 
 apply_patches() {
 	local patch_dir="${1:-patches}"
@@ -28,6 +113,15 @@ apply_patches() {
 	local unicode_green_circle="\e[32m"$'\U2B24'"\e[0m"
 	local unicode_yellow_circle="\e[33m"$'\U2B24'"\e[0m"
 	local unicode_blue_circle="\e[34m"$'\U2B24'"\e[0m"
+
+	# Validate boolean flags when called as a library function
+	local flag_val
+	for flag_val in "$dry_run" "$verbose" "$force" "$delete_failed"; do
+		if [[ $flag_val != "true" && $flag_val != "false" ]]; then
+			printf '\n%b Invalid boolean parameter: %s (expected true or false)\n' "$unicode_red_circle" "$flag_val" >&2
+			return 1
+		fi
+	done
 
 	# Validate caller directory exists (sanity check)
 	if [[ ! -d $caller_dir ]]; then
@@ -60,7 +154,7 @@ apply_patches() {
 			return 1
 		fi
 
-		if [[ -e $git_repo/.git ]]; then
+		if [[ -e $git_repo/.git ]] && command -v git > /dev/null 2>&1 && git -C "$git_repo" rev-parse --git-dir > /dev/null 2>&1; then
 			is_git_repo="true"
 			printf '\n%b Target git repository: %b%s%b\n' "${unicode_blue_circle}" "${color_blue}" "$git_repo" "${color_end}"
 		else
@@ -69,11 +163,17 @@ apply_patches() {
 		fi
 	else
 		git_repo="${caller_dir}"
-		if [[ -e $git_repo/.git ]]; then
+		if [[ -e $git_repo/.git ]] && command -v git > /dev/null 2>&1 && git -C "$git_repo" rev-parse --git-dir > /dev/null 2>&1; then
 			is_git_repo="true"
 		else
 			is_git_repo="false"
 		fi
+	fi
+
+	# Verify required tool exists before processing patches (prevents false failures and -x mass deletion)
+	if [[ $is_git_repo == "false" ]] && ! command -v patch > /dev/null 2>&1; then
+		printf '\n%b Error: '\''patch'\'' command not found in PATH\n' "${unicode_red_circle}" >&2
+		return 1
 	fi
 
 	# If patch_dir is not an absolute path, make it relative to caller's directory
@@ -121,10 +221,22 @@ apply_patches() {
 
 		local error_message=""
 
+		if patch_has_path_traversal "$patch_file"; then
+			error_message="Security: patch contains parent directory traversal ('..')"
+			printf '  %b %bFailed%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
+			printf '  %b %bReason:%b\n      %s\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}" "$error_message"
+			failed_patches+=("$patch_name")
+			continue
+		fi
+
 		if [[ $dry_run == "true" ]]; then
 			if [[ $is_git_repo == "true" ]]; then
-				if error_message=$(git -C "$git_repo" apply --check "$patch_file" 2>&1); then
+				if error_message=$(git -C "$git_repo" apply --check -- "$patch_file" 2>&1); then
 					printf '\n  %b %bOK%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
+				elif [[ $force == "true" ]] && git -C "$git_repo" apply --check --ignore-whitespace -- "$patch_file" 2> /dev/null; then
+					printf '\n  %b %bOK (ignored whitespace)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
+				elif git_try_3way "$git_repo" "$patch_file" "true"; then
+					printf '\n  %b %bOK (3-way merge)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 				else
 					printf '  %b %bFailed%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
 					failed_patches+=("$patch_name")
@@ -134,8 +246,10 @@ apply_patches() {
 				fi
 			else
 				# Use patch command in batch/forward mode for non-git directories
-				if error_message=$(patch -d "$git_repo" --batch --forward --dry-run -p1 -i "$patch_file" 2>&1); then
+				if error_message=$(patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --dry-run -p1 -i "$patch_file" 2>&1); then
 					printf '\n  %b %bOK%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
+				elif [[ $force == "true" ]] && patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --ignore-whitespace --dry-run -p1 -i "$patch_file" > /dev/null 2>&1; then
+					printf '\n  %b %bOK (ignored whitespace)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 				else
 					printf '\n  %b %bFailed%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
 					failed_patches+=("$patch_name")
@@ -148,38 +262,30 @@ apply_patches() {
 			local applied="false"
 
 			if [[ $is_git_repo == "true" ]]; then
-				# Git repository - use git apply
-				if error_message=$(git -C "$git_repo" apply "$patch_file" 2>&1); then
+				# Git repository - use transactional 3-way merge fallback so failed merges never dirty index/worktree
+				if error_message=$(git -C "$git_repo" apply -- "$patch_file" 2>&1); then
 					printf '\n  %b %bApplied%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
-				elif [[ $force == "true" ]] && git -C "$git_repo" apply --ignore-whitespace "$patch_file" 2> /dev/null; then
+				elif [[ $force == "true" ]] && git -C "$git_repo" apply --ignore-whitespace -- "$patch_file" 2> /dev/null; then
 					printf '  %b %bApplied (ignored whitespace)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
-				elif git -C "$git_repo" apply --3way "$patch_file" 2> /dev/null; then
+				elif git_try_3way "$git_repo" "$patch_file" "false"; then
 					printf '  %b %bApplied with 3-way merge%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
-				else
-					# Clean up any unmerged conflict state left behind by failed --3way
-					local unmerged_file
-					while IFS= read -r unmerged_file; do
-						[[ -n $unmerged_file ]] || continue
-						git -C "$git_repo" reset -q -- "$unmerged_file" 2> /dev/null
-						git -C "$git_repo" checkout -q -- "$unmerged_file" 2> /dev/null
-					done < <(git -C "$git_repo" diff --name-only --diff-filter=U 2> /dev/null)
 				fi
 			else
-				# Non-git directory - verify with --dry-run first so failed patches never partially mutate files
-				if error_message=$(patch -d "$git_repo" --batch --forward --dry-run -p1 -i "$patch_file" 2>&1) \
-					&& patch -d "$git_repo" --batch --forward -p1 -i "$patch_file" > /dev/null 2>&1; then
+				# Non-git directory - verify with --dry-run first and suppress .orig/.rej files
+				if error_message=$(patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --dry-run -p1 -i "$patch_file" 2>&1) \
+					&& patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - -p1 -i "$patch_file" > /dev/null 2>&1; then
 					printf '\n  %b %bApplied%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
 				elif [[ $force == "true" ]] \
-					&& patch -d "$git_repo" --batch --forward --ignore-whitespace --dry-run -p1 -i "$patch_file" > /dev/null 2>&1 \
-					&& patch -d "$git_repo" --batch --forward --ignore-whitespace -p1 -i "$patch_file" > /dev/null 2>&1; then
+					&& patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --ignore-whitespace --dry-run -p1 -i "$patch_file" > /dev/null 2>&1 \
+					&& patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --ignore-whitespace -p1 -i "$patch_file" > /dev/null 2>&1; then
 					printf '  %b %bApplied (ignored whitespace)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
@@ -187,48 +293,56 @@ apply_patches() {
 			fi
 
 			if [[ $applied == "false" ]]; then
+				local reason_summary="${error_message%%$'\n'*}"
 				printf '\n  %b %bFailed to apply%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
 				printf '  %b %bReason:%b\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}"
-				printf '%s\n' "$error_message" | sed 's/^/      /'
+				printf '%s\n' "$reason_summary" | sed 's/^/      /'
 				failed_patches+=("$patch_name")
 				if [[ $verbose == "true" ]]; then
+					local quoted_patch quoted_repo
+					printf -v quoted_patch '%q' "$patch_file"
+					printf -v quoted_repo '%q' "$git_repo"
 					printf '\n%b%s%b\n' "${color_yellow}" "    Detailed error:" "${color_end}"
 					if [[ $is_git_repo == "true" ]]; then
-						git -C "$git_repo" apply --check --verbose "$patch_file" 2>&1 | sed 's/^/      /'
+						git -C "$git_repo" apply --check --verbose -- "$patch_file" 2>&1 | sed 's/^/      /'
 					else
 						printf '%s\n' "$error_message" | sed 's/^/      /'
 					fi
 					printf '\n%b     To fix this patch, try one of these approaches: %b\n' "${color_yellow}" "${color_end}"
 					if [[ $is_git_repo == "true" ]]; then
-						printf '\n%b  1.%b%b Manual 3-way merge:%b   git apply --3way --verbose %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "${color_cyan}" "'$patch_file'" "${color_end}"
-						printf '\n%b  2.%b%b Ignore whitespace:%b    git apply --ignore-whitespace %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "${color_cyan}" "'$patch_file'" "${color_end}"
-						printf '\n%b  3.%b%b Check what failed:%b    git apply --check --verbose %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "${color_cyan}" "'$patch_file'" "${color_end}"
-						printf '\n%b  4.%b%b Apply with reject:%b    git apply --reject %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "${color_cyan}" "'$patch_file'" "${color_end}"
+						printf '\n%b  1.%b%b Manual 3-way merge:%b   git -C %s apply --3way --verbose %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "$quoted_repo" "${color_cyan}" "$quoted_patch" "${color_end}"
+						printf '\n%b  2.%b%b Ignore whitespace:%b    git -C %s apply --ignore-whitespace %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "$quoted_repo" "${color_cyan}" "$quoted_patch" "${color_end}"
+						printf '\n%b  3.%b%b Check what failed:%b    git -C %s apply --check --verbose %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "$quoted_repo" "${color_cyan}" "$quoted_patch" "${color_end}"
+						printf '\n%b  4.%b%b Apply with reject:%b    git -C %s apply --reject %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "$quoted_repo" "${color_cyan}" "$quoted_patch" "${color_end}"
 					else
-						printf '\n%b     1.%b%b Ignore whitespace:%b    patch --ignore-whitespace -p1 -i %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "${color_cyan}" "'$patch_file'" "${color_end}"
-						printf '\n%b     2.%b%b Check what failed:%b    patch --dry-run -p1 -i %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "${color_cyan}" "'$patch_file'" "${color_end}"
-						printf '\n%b     3.%b%b Apply with reject:%b    patch --reject-file=- -p1 -i %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "${color_cyan}" "'$patch_file'" "${color_end}"
-						printf '\n%b     4.%b%b Try different strip:%b  patch -p0 -i %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "${color_cyan}" "'$patch_file'" "${color_end}"
+						printf '\n%b     1.%b%b Ignore whitespace:%b    patch -d %s --ignore-whitespace -p1 -i %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "$quoted_repo" "${color_cyan}" "$quoted_patch" "${color_end}"
+						printf '\n%b     2.%b%b Check what failed:%b    patch -d %s --dry-run -p1 -i %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "$quoted_repo" "${color_cyan}" "$quoted_patch" "${color_end}"
+						printf '\n%b     3.%b%b Apply with reject:%b    patch -d %s --reject-file=- -p1 -i %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "$quoted_repo" "${color_cyan}" "$quoted_patch" "${color_end}"
+						printf '\n%b     4.%b%b Try different strip:%b  patch -d %s -p0 -i %b%s%b\n' "${color_magenta}" "${color_end}" "${color_green}" "${color_end}" "$quoted_repo" "${color_cyan}" "$quoted_patch" "${color_end}"
 					fi
-					printf '\n%b     5.%b%b View patch content:%b   cat %b%s%b\n' "${color_magenta}" "${color_end}" "${color_cyan}" "${color_end}" "${color_yellow}" "'$patch_file'" "${color_end}"
-					printf '\n%b     6.%b%b Apply manually:%b       patch -p1 < %b%s%b\n' "${color_magenta}" "${color_end}" "${color_cyan}" "${color_end}" "${color_yellow}" "'$patch_file'" "${color_end}"
+					printf '\n%b     5.%b%b View patch content:%b   cat %b%s%b\n' "${color_magenta}" "${color_end}" "${color_cyan}" "${color_end}" "${color_yellow}" "$quoted_patch" "${color_end}"
+					printf '\n%b     6.%b%b Apply manually:%b       patch -d %s -p1 < %b%s%b\n' "${color_magenta}" "${color_end}" "${color_cyan}" "${color_end}" "$quoted_repo" "${color_yellow}" "$quoted_patch" "${color_end}"
 				fi
 			fi
 		fi
 	done
 
-	# Save failed patches to file if requested
-	if [[ -n $failed_patches_file && ${#failed_patches[@]} -gt 0 ]]; then
+	# Save failed patches to file if requested (or remove stale file if all passed)
+	if [[ -n $failed_patches_file ]]; then
 		local output_file="$failed_patches_file"
 		if [[ $output_file != /* ]]; then
 			output_file="${caller_dir}/${failed_patches_file}"
 		fi
 
-		printf '\n%b Saving %b%d%b failed patch file names to: %b%s%b\n' "${unicode_blue_circle}" "${color_yellow}" "${#failed_patches[@]}" "${color_end}" "${color_blue}" "$output_file" "${color_end}"
-		if printf '%s\n' "${failed_patches[@]}" > "$output_file"; then
-			printf '%b %b%s%b\n' "${unicode_green_circle}" "${color_green}" "Failed patches saved successfully" "${color_end}"
-		else
-			printf '%b %b%s%b\n' "${unicode_yellow_circle}" "${color_yellow}" "Warning: Failed to save failed patches to file" "${color_end}" >&2
+		if [[ ${#failed_patches[@]} -gt 0 ]]; then
+			printf '\n%b Saving %b%d%b failed patch file names to: %b%s%b\n' "${unicode_blue_circle}" "${color_yellow}" "${#failed_patches[@]}" "${color_end}" "${color_blue}" "$output_file" "${color_end}"
+			if printf '%s\n' "${failed_patches[@]}" > "$output_file"; then
+				printf '%b %b%s%b\n' "${unicode_green_circle}" "${color_green}" "Failed patches saved successfully" "${color_end}"
+			else
+				printf '%b %b%s%b\n' "${unicode_yellow_circle}" "${color_yellow}" "Warning: Failed to save failed patches to file" "${color_end}" >&2
+			fi
+		elif [[ -f $output_file ]]; then
+			rm -f -- "$output_file"
 		fi
 	fi
 
@@ -241,7 +355,7 @@ apply_patches() {
 		for patch_name in "${failed_patches[@]}"; do
 			local patch_path="$patch_dir/$patch_name"
 			if [[ -f $patch_path ]]; then
-				if rm "$patch_path" 2> /dev/null; then
+				if rm -- "$patch_path" 2> /dev/null; then
 					printf '  %b %bDeleted:%b %b%s%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}" "${color_cyan}" "$patch_name" "${color_end}"
 					((++deleted_count))
 				else
@@ -296,7 +410,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 
 	# Parse command line arguments
 	while [[ $# -gt 0 ]]; do
-		case $1 in
+		case "$1" in
 			-d | --dry-run)
 				dry_run="true"
 				shift
@@ -313,8 +427,31 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 				force="true"
 				shift
 				;;
+			-x | --delete-failed)
+				delete_failed_patches="true"
+				shift
+				;;
+			-[davfx][davfx]*)
+				flag_cluster="${1#-}"
+				while [[ -n $flag_cluster ]]; do
+					case "${flag_cluster:0:1}" in
+						d) dry_run="true" ;;
+						a) dry_run="false" ;;
+						v) verbose="true" ;;
+						f) force="true" ;;
+						x) delete_failed_patches="true" ;;
+						*)
+							printf '\n%b%s%b\n' "${color_red}" "Unknown option: -${flag_cluster:0:1} (in $1)" "${color_end}" >&2
+							printf '\n%b%s%b\n' "${color_blue}" "Use -h or --help for usage information" "${color_end}" >&2
+							exit 1
+							;;
+					esac
+					flag_cluster="${flag_cluster:1}"
+				done
+				shift
+				;;
 			-r | --repo)
-				if [[ -n $2 && $2 != -* ]]; then
+				if [[ $# -ge 2 && -n ${2:-} && $2 != -* ]]; then
 					git_repo="$2"
 					shift 2
 				else
@@ -322,11 +459,23 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 					exit 1
 				fi
 				;;
+			--repo=*)
+				git_repo="${1#*=}"
+				if [[ -z $git_repo ]]; then
+					printf '\n%b%s%b\n' "${color_red}" "Error: --repo requires a directory argument" "${color_end}" >&2
+					exit 1
+				fi
+				shift
+				;;
 			-s | --save-failed)
-				if [[ -n $2 && $2 != -* ]]; then
+				if [[ $# -ge 2 && -n ${2:-} && $2 != -* ]]; then
 					failed_patches_file="$2"
-					if [[ $2 == */* && ! -d ${2%/*} ]]; then
-						printf '\n%b%s%b\n' "${color_yellow}" "Warning: Directory '${2%/*}' does not exist" "${color_end}" >&2
+					if [[ $2 == */* ]]; then
+						save_parent="${2%/*}"
+						[[ -z $save_parent ]] && save_parent="/"
+						if [[ ! -d $save_parent ]]; then
+							printf '\n%b%s%b\n' "${color_yellow}" "Warning: Directory '$save_parent' does not exist" "${color_end}" >&2
+						fi
 					fi
 					shift 2
 				else
@@ -334,9 +483,33 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 					exit 1
 				fi
 				;;
-			-x | --delete-failed)
-				delete_failed_patches="true"
+			--save-failed=*)
+				failed_patches_file="${1#*=}"
+				if [[ -z $failed_patches_file ]]; then
+					printf '\n%b%s%b\n' "${color_red}" "Error: --save-failed requires a file path argument" "${color_end}" >&2
+					exit 1
+				fi
+				if [[ $failed_patches_file == */* ]]; then
+					save_parent="${failed_patches_file%/*}"
+					[[ -z $save_parent ]] && save_parent="/"
+					if [[ ! -d $save_parent ]]; then
+						printf '\n%b%s%b\n' "${color_yellow}" "Warning: Directory '$save_parent' does not exist" "${color_end}" >&2
+					fi
+				fi
 				shift
+				;;
+			--)
+				shift
+				while [[ $# -gt 0 ]]; do
+					if [[ -z $patch_dir ]]; then
+						patch_dir="$1"
+					else
+						printf '\n%b%s%b\n' "${color_red}" "Error: Multiple patch directories specified" "${color_end}" >&2
+						exit 1
+					fi
+					shift
+				done
+				break
 				;;
 			-h | --help)
 				printf '\n%b%s%b\n' "${color_cyan}" "Usage: $script_name [OPTIONS] [patch_directory]" "${color_end}"
