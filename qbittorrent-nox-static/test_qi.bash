@@ -1302,12 +1302,17 @@ test_unit_check_supported_distro_hardening() {
 	run_lib check_supported_distro
 	assert_rc "rejects ID_LIKE substring debianx/notdebian" 1
 
-	# Check that os-release variables do not leak into caller scope
-	set_os_release 'ID=debian\nID_LIKE=debian\nPRETTY_NAME="Debian"\n'
+	# Check that NO os-release variables (ID, ID_LIKE, PRETTY_NAME, NAME) leak into caller scope
+	set_os_release 'ID=debian\nID_LIKE=debian\nPRETTY_NAME="Debian"\nNAME="Debian GNU/Linux"\n'
 	# shellcheck disable=SC2016
-	_capture "$bash_bin" -c 'source "$1"; check_supported_distro; printf "%s|%s" "${ID:-}" "${ID_LIKE:-}"' _ "$sb/qi.bash"
+	_capture "$bash_bin" -c 'source "$1"; check_supported_distro; printf "%s|%s|%s|%s" "${ID:-}" "${ID_LIKE:-}" "${PRETTY_NAME:-}" "${NAME:-}"' _ "$sb/qi.bash"
 	assert_rc "supported distro returns 0" 0
-	assert_eq "ID and ID_LIKE do not leak into global scope" "|" "$out"
+	assert_eq "os-release vars do not leak into global scope" "|||" "$out"
+
+	# Malformed os-release fails cleanly with exit 1 instead of crashing caller shell
+	set_os_release 'ID=debian\nmalformed=(unclosed\n'
+	run_lib check_supported_distro
+	assert_rc "malformed os-release exits 1 cleanly" 1
 }
 
 test_unit_print_output_url_and_escape_safety() {
@@ -1348,19 +1353,22 @@ EOF
 }
 
 test_unit_verify_asset_name_binding() {
-	# Multi-arch API fixture with distinct asset names: x86_64 has fake_sha, aarch64 has abc_sha
+	# Multi-arch API fixture with:
+	# - digest BEFORE name on x86_64 (alphabetical JSON key order)
+	# - uploader containing both '[bot]' brackets and a nested "name" field
+	# - body mentioning abc_sha outside .assets
 	cat > "$sb/mock/api.json" << EOF
 {
   "tag_name": "$tag_21",
   "assets": [
     {
+      "digest": "sha256:$fake_sha",
       "name": "x86_64-qbittorrent-nox",
-      "uploader": { "login": "github-actions[bot]" },
-      "digest": "sha256:$fake_sha"
+      "uploader": { "login": "github-actions[bot]", "name": "GitHub Actions" }
     },
     {
       "name": "aarch64-qbittorrent-nox",
-      "uploader": { "login": "github-actions[bot]" },
+      "uploader": { "login": "github-actions[bot]", "name": "GitHub Actions" },
       "digest": "sha256:$abc_sha"
     }
   ],
@@ -1371,19 +1379,26 @@ EOF
 
 	# Without jq: x86_64 must NOT accept aarch64's digest or release body digest
 	run_lib verify_binary_integrity "$sb/payload" "$tag_21" x86_64
-	assert_rc "grep/bash path rejects cross-arch digest" 2
+	assert_rc "grep/bash path rejects cross-arch digest (even with digest-before-name)" 2
 
-	# Without jq: aarch64 matches its own asset digest
+	# Without jq: aarch64 matches its own asset digest despite uploader.name
 	run_lib verify_binary_integrity "$sb/payload" "$tag_21" aarch64
 	assert_rc "grep/bash path accepts matching arch digest" 0
 
-	# With jq (if available on host): same asset-binding guarantee
+	# Without jq: requesting missing riscv64 when other *-qbittorrent-nox assets exist must NOT spoof with aarch64's digest
+	run_lib verify_binary_integrity "$sb/payload" "$tag_21" riscv64
+	assert_rc "grep/bash path returns 1 (unverifiable) when target arch asset is absent" 1
+
+	# With jq (if available on host): same asset-binding guarantees
 	if add_real_tool jq; then
 		run_lib verify_binary_integrity "$sb/payload" "$tag_21" x86_64
 		assert_rc "jq path rejects cross-arch digest" 2
 
 		run_lib verify_binary_integrity "$sb/payload" "$tag_21" aarch64
 		assert_rc "jq path accepts matching arch digest" 0
+
+		run_lib verify_binary_integrity "$sb/payload" "$tag_21" riscv64
+		assert_rc "jq path returns 1 (unverifiable) when target arch asset is absent" 1
 	fi
 }
 
@@ -1475,6 +1490,59 @@ test_install_path_trailing_slash() {
 	run_qi
 	assert_rc "exits 0" 0
 	assert_not_contains "no false PATH warning when PATH entry has trailing slash" "$err" "is not in your PATH"
+}
+
+test_unit_handle_error_non_numeric() {
+	run_lib handle_error "" "mycmd" "empty exit code"
+	assert_rc "empty exit code defaults to 1 instead of silently succeeding" 1
+	assert_contains "reports exit code 1" "$err" "Exit code: 1"
+
+	run_lib handle_error "not_a_number" "mycmd" "non-numeric exit code"
+	assert_rc "non-numeric exit code defaults to 1 without arithmetic eval" 1
+}
+
+test_unit_detect_arch_empty_output() {
+	set_arch dpkg ""
+	run_lib detect_arch
+	assert_rc "empty arch output exits 1" 1
+	assert_contains "reports empty output" "$err" "Architecture detection returned empty output"
+}
+
+test_unit_get_release_tag_numeric_revision_and_jq() {
+	printf '{"qbittorrent":"5.3.0","libtorrent_2_1":"2.1.2","revision":12}\n' > "$sb/mock/release.json"
+	run_lib get_release_tag
+	assert_rc "unquoted numeric revision parses without jq" 0
+	assert_eq "numeric revision returned" "$tag_21 12" "$out"
+
+	if add_real_tool jq; then
+		run_lib get_release_tag
+		assert_rc "unquoted numeric revision parses with jq" 0
+		assert_eq "numeric revision returned via jq" "$tag_21 12" "$out"
+	fi
+}
+
+test_unit_parse_args_isolation_and_end_of_options() {
+	# parse_args must not leak temporary globals and must handle -- and flag-swallowing on -fa
+	# shellcheck disable=SC2016
+	_capture "$bash_bin" -c 'source "$1"; parse_args --libtorrent=v1 --force-arch=armv7 --; printf "%s|%s|%s|%s" "$LIBTORRENT_VERSION" "$FORCE_ARCH" "${opt:-}" "${val:-}"' _ "$sb/qi.bash"
+	assert_rc "parse_args succeeds with --" 0
+	assert_eq "sets target vars without leaking opt/val" "v1|armv7||" "$out"
+
+	run_qi -- extra
+	assert_rc "positional arg after -- exits 1" 1
+	assert_contains "reports unknown option after --" "$err" "Unknown option: extra"
+
+	run_qi -fa --help
+	assert_rc "-fa followed by --help rejects missing arch" 1
+	assert_contains "-fa --help reports missing architecture" "$err" "Option -fa requires an architecture"
+}
+
+test_install_refuses_when_target_is_directory() {
+	mkdir -p "$sb/home/bin/qbittorrent-nox"
+	run_qi
+	assert_rc "target path being a directory exits 1" 1
+	assert_contains "reports target is a directory" "$err" "is a directory"
+	assert_not_called "does not download binary when install_path is a directory" "-qbittorrent-nox"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

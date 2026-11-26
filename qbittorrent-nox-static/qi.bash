@@ -7,11 +7,16 @@ tmp_path=""
 
 # Error handling function to test commands and exit with helpful explanations
 handle_error() {
-	local exit_code="$1"
-	local command="$2"
-	local context="$3"
+	local exit_code="${1:-1}"
+	local command="${2:-unknown}"
+	local context="${3:-unknown error}"
 
-	if [[ $exit_code -ne 0 ]]; then
+	# Guard against empty or non-numeric exit codes before arithmetic comparison
+	if [[ ! $exit_code =~ ^[0-9]+$ ]]; then
+		exit_code=1
+	fi
+
+	if ((exit_code != 0)); then
 		print_failure "Command failed: $command"
 		print_error "Context: $context"
 		print_error "Exit code: $exit_code"
@@ -23,22 +28,29 @@ handle_error() {
 
 # Check supported distributions
 check_supported_distro() {
-	# Localize ID and ID_LIKE so caller env cannot spoof distro checks and globals stay clean
-	local ID="" ID_LIKE=""
-
-	if [[ -f /etc/os-release ]]; then
-		# shellcheck source=/dev/null
-		source /etc/os-release
-		# Support Alpine or Debian-based distributions (match ID_LIKE as whitespace-delimited tokens)
-		if [[ ${ID:-} =~ ^(alpine|debian)$ ]] || [[ " ${ID_LIKE:-} " == *" debian "* ]]; then
-			return 0 # Supported distribution
-		else
-			print_error "Unsupported distribution: ${ID:-unknown}. This installer only supports Alpine or Debian-based distributions"
-			exit 1
-		fi
-	else
+	if [[ ! -f /etc/os-release ]]; then
 		print_error "Cannot determine distribution. /etc/os-release not found"
 		print_error "This installer only supports Alpine or Debian-based distributions"
+		exit 1
+	fi
+
+	# Source /etc/os-release in an isolated subshell so caller env cannot spoof ID/ID_LIKE
+	# and none of os-release's variables (NAME, PRETTY_NAME, VERSION, etc.) pollute globals
+	local distro_id
+	if ! distro_id=$(
+		unset ID ID_LIKE
+		# shellcheck source=/dev/null
+		source /etc/os-release 2> /dev/null || {
+			printf '%s' "unknown"
+			exit 1
+		}
+		if [[ ${ID:-} =~ ^(alpine|debian)$ ]] || [[ " ${ID_LIKE:-} " == *" debian "* ]]; then
+			exit 0
+		fi
+		printf '%s' "${ID:-unknown}"
+		exit 1
+	); then
+		print_error "Unsupported distribution: ${distro_id:-unknown}. This installer only supports Alpine or Debian-based distributions"
 		exit 1
 	fi
 }
@@ -135,13 +147,20 @@ detect_arch() {
 		}
 	elif command -v arch > /dev/null 2>&1; then
 		# Fallback to arch command
-		arch_output="$(arch)" || {
+		arch_output="$(arch 2> /dev/null)" || {
 			print_error "Failed to detect architecture using arch command"
 			exit 1
 		}
 	else
 		print_error "No architecture detection tool found (apk/dpkg/arch)"
 		print_error "Please install the appropriate package manager or set FORCE_ARCH environment variable"
+		exit 1
+	fi
+
+	# Trim whitespace/CRs and guard against empty output
+	arch_output="${arch_output//[[:space:]]/}"
+	if [[ -z $arch_output ]]; then
+		print_error "Architecture detection returned empty output"
 		exit 1
 	fi
 
@@ -337,23 +356,31 @@ verify_binary_integrity() {
 		return 1
 	fi
 
-	# Extract SHA256 digests from API response; bind to exact asset name when present
+	# Extract SHA256 digests from API response; bind to exact asset name when present.
+	# If other *-qbittorrent-nox assets exist without the target arch, do not fall back to their digests.
 	local raw_digests=""
 	if command -v jq > /dev/null 2>&1; then
 		if jq -e --arg name "$expected_asset" '(.assets // []) | any(.name == $name)' <<< "$api_response" > /dev/null 2>&1; then
 			raw_digests=$(jq -r --arg name "$expected_asset" '(.assets // [])[] | select(.name == $name) | .digest // empty' <<< "$api_response" 2> /dev/null)
+		elif jq -e '(.assets // []) | any((.name // "") | endswith("-qbittorrent-nox"))' <<< "$api_response" > /dev/null 2>&1; then
+			raw_digests=""
 		else
 			raw_digests=$(jq -r '(.assets // [])[].digest // empty' <<< "$api_response" 2> /dev/null)
 		fi
 	else
 		local flat_json="${api_response//[$'\r\n']/ }"
-		if [[ $flat_json =~ \"name\"[[:space:]]*:[[:space:]]*\"${expected_asset}\"(.*)$ ]]; then
-			local rest="${BASH_REMATCH[1]}"
-			rest="${rest%%\"name\"*}"
-			rest=$(sed -E 's/\}[[:space:]]*\].*//' <<< "$rest")
-			raw_digests=$(grep -Eo 'sha256:[0-9a-fA-F]{64}' <<< "$rest" 2> /dev/null)
+		local clean_json asset_objects matched_asset
+		# Strip nested uploader object so each asset in .assets is a flat {...} block independent of key order
+		clean_json=$(sed -E 's/"uploader"[[:space:]]*:[[:space:]]*\{[^{}]*\}//g' <<< "$flat_json")
+		asset_objects=$(grep -Eo '\{[^{}]*\}' <<< "$clean_json" 2> /dev/null)
+
+		matched_asset=$(grep -E "\"name\"[[:space:]]*:[[:space:]]*\"${expected_asset}\"" <<< "$asset_objects" 2> /dev/null)
+		if [[ -n $matched_asset ]]; then
+			raw_digests=$(grep -Eo 'sha256:[0-9a-fA-F]{64}' <<< "$matched_asset" 2> /dev/null)
+		elif grep -qE '"name"[[:space:]]*:[[:space:]]*"[^"]*-qbittorrent-nox"' <<< "$asset_objects" 2> /dev/null; then
+			raw_digests=""
 		else
-			raw_digests=$(grep -Eo 'sha256:[0-9a-fA-F]{64}' <<< "$api_response" 2> /dev/null)
+			raw_digests=$(grep -Eo 'sha256:[0-9a-fA-F]{64}' <<< "$asset_objects" 2> /dev/null)
 		fi
 	fi
 
@@ -444,10 +471,17 @@ get_release_tag() {
 		exit 1
 	fi
 
-	# Parse release tag (works on pretty-printed, compact, and trailing-comma-free JSON)
-	local qbt_ver libt_ver
-	qbt_ver=$(sed -En 's/.*"qbittorrent"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' <<< "$response" | head -n 1)
-	libt_ver=$(sed -En "s/.*\"${json_key}\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\1/p" <<< "$response" | head -n 1)
+	# Parse release tag (use jq when available, otherwise non-greedy sed)
+	local qbt_ver="" libt_ver="" revision=""
+	if command -v jq > /dev/null 2>&1; then
+		qbt_ver=$(jq -r '.qbittorrent // empty' <<< "$response" 2> /dev/null)
+		libt_ver=$(jq -r --arg k "$json_key" '.[$k] // empty' <<< "$response" 2> /dev/null)
+		revision=$(jq -r 'if .revision == null then "" else (.revision | tostring) end' <<< "$response" 2> /dev/null)
+	else
+		qbt_ver=$(sed -En 's/.*"qbittorrent"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' <<< "$response" | head -n 1)
+		libt_ver=$(sed -En "s/.*\"${json_key}\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\1/p" <<< "$response" | head -n 1)
+		revision=$(sed -En 's/.*"revision"[[:space:]]*:[[:space:]]*"?([^",}[:space:]]+)"?.*/\1/p' <<< "$response" | head -n 1)
+	fi
 
 	if [[ -z $qbt_ver ]] || [[ -z $libt_ver ]]; then
 		print_error "Failed to parse version information from API response"
@@ -463,9 +497,6 @@ get_release_tag() {
 		exit 1
 	fi
 
-	# Parse revision field
-	local revision
-	revision=$(sed -En 's/.*"revision"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' <<< "$response" | head -n 1)
 	if [[ -z $revision ]]; then
 		print_warning "Failed to parse revision from API response"
 	elif [[ ! $revision =~ ^[0-9A-Za-z._+-]+$ || $revision == *..* ]]; then
@@ -551,6 +582,11 @@ main() {
 		handle_error $? "mkdir -p $bin_dir" "Failed to create installation directory"
 	}
 
+	if [[ -d $install_path ]]; then
+		print_failure "Cannot install binary: $install_path is a directory"
+		exit 1
+	fi
+
 	# Get release and download
 	local url
 	url=$(create_download_url "$arch" "$release_tag")
@@ -558,6 +594,8 @@ main() {
 	# Download to a temp file so a failed download never clobbers a working install
 	tmp_path=""
 	trap cleanup_tmp EXIT
+	trap 'cleanup_tmp; exit 130' INT
+	trap 'cleanup_tmp; exit 143' TERM HUP
 	tmp_path=$(mktemp "${bin_dir}/.qbittorrent-nox.XXXXXX") || {
 		handle_error $? "mktemp ${bin_dir}/.qbittorrent-nox.XXXXXX" "Failed to create temporary file"
 	}
@@ -583,7 +621,7 @@ main() {
 		handle_error $? "mv -f $tmp_path $install_path" "Failed to install binary"
 	}
 	tmp_path=""
-	trap - EXIT
+	trap - EXIT INT TERM HUP
 
 	print_success "Installation complete: $install_path"
 
@@ -635,9 +673,12 @@ main() {
 }
 
 # Simple argument parsing: loop through all args
-if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+parse_args() {
+	local opt val
+
 	while [[ $# -gt 0 ]]; do
-		case "$1" in
+		opt="$1"
+		case "$opt" in
 			-h | --help)
 				cat <<- EOF
 
@@ -666,7 +707,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 				;;
 			-lt | --libtorrent)
 				if [[ $# -lt 2 ]]; then
-					print_error "Option $1 requires a version. Invalid libtorrent version: missing"
+					print_error "Option $opt requires a version. Use -h or --help for usage"
 					exit 1
 				fi
 				shift
@@ -679,18 +720,18 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 				esac
 				;;
 			--libtorrent=*)
-				lt_arg="${1#*=}"
-				case "$lt_arg" in
-					v1 | v1.2 | 1.2 | v2.0 | 2.0 | v2 | v2.1 | 2.1) LIBTORRENT_VERSION="$lt_arg" ;;
+				val="${opt#*=}"
+				case "$val" in
+					v1 | v1.2 | 1.2 | v2.0 | 2.0 | v2 | v2.1 | 2.1) LIBTORRENT_VERSION="$val" ;;
 					*)
-						print_error "Invalid libtorrent version: $lt_arg. Use: v1/v1.2/1.2, v2.0/2.0 or v2/v2.1/2.1"
+						print_error "Invalid libtorrent version: $val. Use: v1/v1.2/1.2, v2.0/2.0 or v2/v2.1/2.1"
 						exit 1
 						;;
 				esac
 				;;
 			-fa | --force-arch)
-				if [[ $# -lt 2 || -z ${2:-} ]]; then
-					print_error "Option $1 requires an architecture. Use -h or --help for usage"
+				if [[ $# -lt 2 || -z ${2:-} || ${2:-} == -* ]]; then
+					print_error "Option $opt requires an architecture. Use -h or --help for usage"
 					exit 1
 				fi
 				shift
@@ -698,21 +739,32 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 				FORCE_ARCH="$1"
 				;;
 			--force-arch=*)
-				fa_arg="${1#*=}"
-				if [[ -z $fa_arg ]]; then
+				val="${opt#*=}"
+				if [[ -z $val ]]; then
 					print_error "Option --force-arch requires an architecture. Use -h or --help for usage"
 					exit 1
 				fi
-				validate_arch "$fa_arg" || exit 1
-				FORCE_ARCH="$fa_arg"
+				validate_arch "$val" || exit 1
+				FORCE_ARCH="$val"
+				;;
+			--)
+				shift
+				if [[ $# -gt 0 ]]; then
+					print_error "Unknown option: $1. Use -h or --help for usage"
+					exit 1
+				fi
+				break
 				;;
 			*)
-				print_error "Unknown option: $1. Use -h or --help for usage"
+				print_error "Unknown option: $opt. Use -h or --help for usage"
 				exit 1
 				;;
 		esac
 		shift
 	done
+}
 
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+	parse_args "$@"
 	main
 fi
