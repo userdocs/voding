@@ -184,14 +184,23 @@ EOF
 add_curl() {
 	make_shim curl << 'EOF'
 source "$MOCK_DIR/serve.bash"
-out="" url=""
+out="" url="" fail_flag=false
 while (($#)); do
 	case "$1" in
 		-o) out="$2"; shift ;;
+		-*f*) fail_flag=true ;;
 		http*) url="$1" ;;
 	esac
 	shift
 done
+if [[ -e $MOCK_DIR/http_404 ]]; then
+	printf 'curl %s\n' "$url" >> "$MOCK_DIR/calls.log"
+	if [[ $fail_flag == true ]]; then
+		exit 22
+	fi
+	printf '<html>404 Not Found</html>\n'
+	exit 0
+fi
 mock_serve curl "$url" "$out"
 EOF
 }
@@ -296,7 +305,7 @@ seed_existing() {
 }
 
 set_os_release() {
-	printf "$1" > "$sb/os-release"
+	printf '%b' "$1" > "$sb/os-release"
 }
 
 new_sandbox() {
@@ -318,9 +327,8 @@ new_sandbox() {
 	write_release_json
 	set_binary good
 
-	# Copies of the script with /etc/os-release redirected; the lib copy has main and the parser removed
+	# Copy with /etc/os-release redirected; qi.bash's source guard keeps sourcing side-effect free
 	sed "s|/etc/os-release|$sb/os-release|g" "$qi_src" > "$sb/qi.bash"
-	sed -e "s|/etc/os-release|$sb/os-release|g" -e '/^# Simple argument parsing/,$d' "$qi_src" > "$sb/qi_lib.bash"
 
 	qi_env=()
 	qi_path=""
@@ -342,9 +350,10 @@ run_qi() {
 	_capture "$bash_bin" "$sb/qi.bash" "$@"
 }
 
-# run_lib <function> [args...] - call a function from the sourced (side-effect free) copy
+# run_lib <function> [args...] - call a function by sourcing qi.bash directly via its source guard
 run_lib() {
-	_capture "$bash_bin" -c 'source "$1"; shift; "$@"' _ "$sb/qi_lib.bash" "$@"
+	# shellcheck disable=SC2016
+	_capture "$bash_bin" -c 'source "$1"; shift; "$@"' _ "$sb/qi.bash" "$@"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -361,16 +370,17 @@ test_static_syntax() {
 test_static_shellcheck() {
 	need_tool shellcheck || return
 	local report
-	report="$(shellcheck -S warning "$qi_src" 2>&1)"
-	assert_eq "qi.bash has no shellcheck warnings" "" "$report"
-	report="$(shellcheck -S warning "${BASH_SOURCE[0]}" 2>&1)"
-	assert_eq "test_qi.bash has no shellcheck warnings" "" "$report"
+	report="$(shellcheck -s bash "$qi_src" 2>&1)"
+	assert_eq "qi.bash has no shellcheck diagnostics" "" "$report"
+	report="$(shellcheck -s bash "${BASH_SOURCE[0]}" 2>&1)"
+	assert_eq "test_qi.bash has no shellcheck diagnostics" "" "$report"
 }
 
 test_static_shfmt() {
 	local shfmt_bin
 	shfmt_bin="$(command -v shfmt || true)"
 	[[ -z $shfmt_bin && -x $HOME/bin/shfmt ]] && shfmt_bin="$HOME/bin/shfmt"
+	[[ -z $shfmt_bin && -x /mnt/c/bin/shfmt.exe ]] && shfmt_bin="/mnt/c/bin/shfmt.exe"
 	if [[ -z $shfmt_bin ]]; then
 		skip_reason="shfmt not installed"
 		return
@@ -378,6 +388,8 @@ test_static_shfmt() {
 	local diff_out
 	diff_out="$("$shfmt_bin" -s -bn -ci -sr -i 0 -d "$qi_src" 2>&1)"
 	assert_eq "qi.bash is shfmt formatted" "" "$diff_out"
+	diff_out="$("$shfmt_bin" -s -bn -ci -sr -i 0 -d "${BASH_SOURCE[0]}" 2>&1)"
+	assert_eq "test_qi.bash is shfmt formatted" "" "$diff_out"
 }
 
 test_static_conventions() {
@@ -1260,6 +1272,209 @@ test_install_unwritable_bin_dir() {
 	assert_rc_nonzero "unwritable bin dir is fatal"
 	assert_contains "reports temp file failure" "$err" "Failed to create temporary file"
 	assert_eq "nothing written" "" "$(bin_listing)"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Hardening & Regression Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+test_unit_source_guard() {
+	# Sourcing qi.bash directly must not run main, parse caller args, or touch network
+	# shellcheck disable=SC2016
+	_capture "$bash_bin" -c 'target="$1"; set -- --bogus-arg; source "$target"' _ "$sb/qi.bash"
+	assert_rc "sourcing qi.bash exits 0 even with caller args" 0
+	assert_eq "sourcing produces no stdout" "" "$out"
+	assert_eq "sourcing produces no stderr" "" "$err"
+	assert_eq "sourcing makes no network calls" "" "$(calls_log)"
+}
+
+test_unit_check_supported_distro_hardening() {
+	# Caller environment ID/ID_LIKE must not spoof an unsupported distro
+	set_os_release 'ID=arch\n'
+	qi_env=("ID=debian" "ID_LIKE=debian")
+	run_lib check_supported_distro
+	assert_rc "env ID_LIKE=debian cannot spoof ID=arch" 1
+	assert_contains "reports arch as unsupported" "$err" "Unsupported distribution: arch"
+	qi_env=()
+
+	# Substring false positives in ID_LIKE must be rejected
+	set_os_release 'ID=custom\nID_LIKE="debianx notdebian"\n'
+	run_lib check_supported_distro
+	assert_rc "rejects ID_LIKE substring debianx/notdebian" 1
+
+	# Check that os-release variables do not leak into caller scope
+	set_os_release 'ID=debian\nID_LIKE=debian\nPRETTY_NAME="Debian"\n'
+	# shellcheck disable=SC2016
+	_capture "$bash_bin" -c 'source "$1"; check_supported_distro; printf "%s|%s" "${ID:-}" "${ID_LIKE:-}"' _ "$sb/qi.bash"
+	assert_rc "supported distro returns 0" 0
+	assert_eq "ID and ID_LIKE do not leak into global scope" "|" "$out"
+}
+
+test_unit_print_output_url_and_escape_safety() {
+	# Colons not followed by space (e.g., URLs) must not duplicate the scheme prefix
+	run_lib print_info "https://example.com/path"
+	assert_contains "URL printed cleanly" "$err" "https://example.com/path"
+	assert_not_contains "scheme prefix not duplicated" "$err" "https: https://"
+
+	# Backslash sequences inside message text must not be interpreted by printf %b
+	run_lib print_info 'literal\c_after_backslash_c'
+	assert_contains "backslash-c does not truncate output" "$err" 'literal\c_after_backslash_c'
+}
+
+test_unit_create_sha256_edge_cases() {
+	# Leading-dash filename in working directory
+	printf 'abc' > "$sb/-dashfile"
+	# shellcheck disable=SC2016
+	_capture "$bash_bin" -c 'cd "$1" && source "$2" && create_sha256 "-dashfile"' _ "$sb" "$sb/qi.bash"
+	assert_rc "leading-dash filename succeeds" 0
+	assert_eq "leading-dash digest matches" "$abc_sha" "$out"
+
+	# sha256sum failure must return 1 rather than 0 masked by a pipeline
+	make_shim sha256sum << 'EOF'
+exit 1
+EOF
+	printf 'abc' > "$sb/payload"
+	run_lib create_sha256 "$sb/payload"
+	assert_rc "failing sha256sum returns 1" 1
+	assert_eq "failing sha256sum prints nothing to stdout" "" "$out"
+
+	# GNU backslash-prefixed output with uppercase hex is normalized
+	make_shim sha256sum << EOF
+printf '\\\\%s  %s\\n' "${abc_sha^^}" "\$1"
+EOF
+	run_lib create_sha256 "$sb/payload"
+	assert_rc "backslash-escaped uppercase sha256sum succeeds" 0
+	assert_eq "normalized to lowercase 64-hex" "$abc_sha" "$out"
+}
+
+test_unit_verify_asset_name_binding() {
+	# Multi-arch API fixture with distinct asset names: x86_64 has fake_sha, aarch64 has abc_sha
+	cat > "$sb/mock/api.json" << EOF
+{
+  "tag_name": "$tag_21",
+  "assets": [
+    {
+      "name": "x86_64-qbittorrent-nox",
+      "uploader": { "login": "github-actions[bot]" },
+      "digest": "sha256:$fake_sha"
+    },
+    {
+      "name": "aarch64-qbittorrent-nox",
+      "uploader": { "login": "github-actions[bot]" },
+      "digest": "sha256:$abc_sha"
+    }
+  ],
+  "body": "Release notes mentioning sha256:$abc_sha"
+}
+EOF
+	printf 'abc' > "$sb/payload"
+
+	# Without jq: x86_64 must NOT accept aarch64's digest or release body digest
+	run_lib verify_binary_integrity "$sb/payload" "$tag_21" x86_64
+	assert_rc "grep/bash path rejects cross-arch digest" 2
+
+	# Without jq: aarch64 matches its own asset digest
+	run_lib verify_binary_integrity "$sb/payload" "$tag_21" aarch64
+	assert_rc "grep/bash path accepts matching arch digest" 0
+
+	# With jq (if available on host): same asset-binding guarantee
+	if add_real_tool jq; then
+		run_lib verify_binary_integrity "$sb/payload" "$tag_21" x86_64
+		assert_rc "jq path rejects cross-arch digest" 2
+
+		run_lib verify_binary_integrity "$sb/payload" "$tag_21" aarch64
+		assert_rc "jq path accepts matching arch digest" 0
+	fi
+}
+
+test_unit_verify_http_404_fails_cleanly() {
+	touch "$sb/mock/http_404"
+	verify_payload
+	assert_rc "HTTP 404 from API returns 1 (unverifiable)" 1
+	assert_contains "reports API fetch failure on 404" "$err" "Failed to fetch release information from GitHub API"
+}
+
+test_unit_get_release_tag_json_formats_and_sanitization() {
+	# Compact minified JSON without trailing comma on parsed keys
+	printf '{"revision":"9","libtorrent_2_1":"2.1.2","qbittorrent":"5.3.0"}' > "$sb/mock/release.json"
+	run_lib get_release_tag
+	assert_rc "compact JSON without trailing comma succeeds" 0
+	assert_eq "compact JSON tag and revision" "$tag_21 9" "$out"
+
+	# Invalid LIBTORRENT_VERSION fails before making any network request
+	: > "$sb/mock/calls.log"
+	qi_env=("LIBTORRENT_VERSION=invalid")
+	run_lib get_release_tag
+	assert_rc "invalid version exits 1" 1
+	assert_eq "no network call made for invalid LIBTORRENT_VERSION" "" "$(calls_log)"
+	qi_env=()
+
+	# Path traversal in qbittorrent version is rejected
+	printf '{"qbittorrent":"../../evil/repo","libtorrent_2_1":"2.1.2","revision":"0"}\n' > "$sb/mock/release.json"
+	run_lib get_release_tag
+	assert_rc "path traversal in qbittorrent version rejected" 1
+	assert_contains "reports invalid version format" "$err" "invalid version format"
+
+	# Whitespace injection in libtorrent version is rejected
+	printf '{"qbittorrent":"5.3.0","libtorrent_2_1":"2.1.2 injected","revision":"0"}\n' > "$sb/mock/release.json"
+	run_lib get_release_tag
+	assert_rc "whitespace in libtorrent version rejected" 1
+
+	# Unsafe characters in revision are warned and cleared rather than emitted
+	printf '{"qbittorrent":"5.3.0","libtorrent_2_1":"2.1.2","revision":"../bad"}\n' > "$sb/mock/release.json"
+	run_lib get_release_tag
+	assert_rc "unsafe revision is non-fatal" 0
+	assert_eq "unsafe revision cleared from output" "$tag_21 " "$out"
+	assert_contains "warns on invalid revision" "$err" "Failed to parse revision"
+
+	# HTTP 404 on dependency-version.json triggers curl -f failure
+	write_release_json
+	touch "$sb/mock/http_404"
+	run_lib get_release_tag
+	assert_rc_nonzero "HTTP 404 on release JSON is fatal"
+	assert_contains "reports fetch failure on 404" "$err" "Failed to fetch release information"
+}
+
+test_cli_equals_syntax() {
+	run_qi --libtorrent=v1 --force-arch=aarch64
+	assert_rc "--libtorrent= and --force-arch= exit 0" 0
+	assert_called "downloads v1 aarch64" "$tag_12/aarch64-qbittorrent-nox"
+
+	run_qi --libtorrent=bogus
+	assert_rc "--libtorrent=bogus exits 1" 1
+	assert_contains "--libtorrent=bogus error" "$err" "Invalid libtorrent version: bogus"
+
+	run_qi --force-arch=bogus
+	assert_rc "--force-arch=bogus exits 1" 1
+	assert_contains "--force-arch=bogus error" "$err" "Unsupported architecture: bogus"
+
+	run_qi --force-arch=
+	assert_rc "--force-arch= empty exits 1" 1
+	assert_contains "--force-arch= empty error" "$err" "requires an architecture"
+}
+
+test_install_missing_home_aborts() {
+	env -i PATH="$sb/shim:$sb/tools" LC_ALL=C.UTF-8 MOCK_DIR="$sb/mock" \
+		"$bash_bin" "$sb/qi.bash" > "$sb/stdout" 2> "$sb/stderr.raw"
+	rc=$?
+	err="$(sed 's/\x1b\[[0-9;]*m//g' "$sb/stderr.raw")"
+	assert_rc "unset HOME exits 1" 1
+	assert_contains "reports missing HOME" "$err" "HOME environment variable is not set"
+	assert_eq "makes no network calls when HOME unset" "" "$(calls_log)"
+}
+
+test_install_checksum_mismatch_never_marks_executable() {
+	write_api_json "$fake_sha"
+	run_qi
+	assert_rc "mismatch exits 1" 1
+	assert_not_contains "never sets executable permissions on unverified binary" "$err" "Setting executable permissions"
+}
+
+test_install_path_trailing_slash() {
+	qi_path="$sb/shim:$sb/tools:$sb/home/bin/"
+	run_qi
+	assert_rc "exits 0" 0
+	assert_not_contains "no false PATH warning when PATH entry has trailing slash" "$err" "is not in your PATH"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
