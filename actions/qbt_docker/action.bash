@@ -181,10 +181,10 @@ validate_input() {
 			fi
 			;;
 		"docker_volume")
-			# Validate volume mount format; block rootfs mount, relative container dest, traversal, whitespace, and Docker socket
+			# Validate volume mount format; block rootfs mount (including /.), relative container dest, traversal, whitespace, and Docker socket
 			if [[ ! $input =~ ^[a-zA-Z0-9._/,:+-]+$ ]] \
 				|| [[ ! $input =~ ^([^:]+:/[^:]+(:[a-zA-Z0-9,._-]+)?|/[^:]+)$ ]] \
-				|| [[ $input =~ ^-|:/$|^/+:|(^|/|:)\.\.(/|:|$)|(^|/|:)docker\.sock(/|:|$) ]] \
+				|| [[ $input =~ ^-|^(/+\.?)+(:|$)|:(/+\.?)+(:|$)|(^|/|:)\.\.(/|:|$)|(^|/|:)docker\.sock(/|:|$) ]] \
 				|| [[ ${#input} -gt 512 ]]; then
 				log_error "Security: Invalid docker volume specification blocked: $input"
 				exit 1
@@ -292,7 +292,7 @@ validate_docker_commands() {
 	done
 }
 
-# Validate a GitHub Actions file-command path (reject symlinks, directories, and missing parent dirs)
+# Validate a GitHub Actions file-command path (reject symlinks, directories, FIFOs, and unwritable targets)
 validate_gh_file_target() {
 	local file_path="$1"
 	local label="$2"
@@ -308,6 +308,10 @@ validate_gh_file_target() {
 		log_error "Security: ${label} must not be a directory: $file_path"
 		return 1
 	fi
+	if [[ -p $file_path ]]; then
+		log_error "Security: ${label} must not be a named pipe: $file_path"
+		return 1
+	fi
 	if [[ $file_path == */* ]]; then
 		parent_dir="${file_path%/*}"
 		[[ -z $parent_dir ]] && parent_dir="/"
@@ -316,6 +320,15 @@ validate_gh_file_target() {
 	fi
 	if [[ ! -d $parent_dir ]]; then
 		log_error "Failed to access parent directory for ${label}: $parent_dir"
+		return 1
+	fi
+	if [[ -e $file_path ]]; then
+		if [[ ! -w $file_path ]]; then
+			log_error "Failed to write to ${label} (not writable): $file_path"
+			return 1
+		fi
+	elif [[ ! -w $parent_dir ]]; then
+		log_error "Failed to write to ${label} (directory not writable): $parent_dir"
 		return 1
 	fi
 	return 0
@@ -445,10 +458,11 @@ detect_os_userdocs() {
 		esac
 	elif [[ -n $base_name && $base_name != "null" ]]; then
 		log_debug "Found userdocs base.name: $base_name" >&2
-		# Parse base.name (e.g., "alpine:edge")
+		# Parse base.name (e.g., "alpine:edge", "registry:5000/library/ubuntu:24.04", "debian@sha256:...")
 		local base_os
-		base_os="${base_name%%:*}" # Extract part before :
-		base_os="${base_os##*/}"   # Extract part after last / (in case of registry prefix)
+		base_os="${base_name%%@*}" # Strip optional @digest first
+		base_os="${base_os##*/}"   # Extract final image component after last / (preserves registry:port)
+		base_os="${base_os%%:*}"   # Strip :tag from image component
 		case "${base_os,,}" in
 			alpine)
 				detected_os="alpine"
@@ -513,8 +527,8 @@ detect_os_official() {
 				log_debug "Detected official/arch-prefixed image, using base: $base_name" >&2
 			fi
 
-			# Extract the base OS name (first part before :)
-			local os_part="${base_name%%:*}"
+			# Extract the base OS name (first part before : or @digest)
+			local os_part="${base_name%%[@:]*}"
 			case "$os_part" in
 				alpine)
 					detected_os="alpine"
@@ -702,6 +716,10 @@ validate_environment_paths() {
 	fi
 	if [[ -L "${workspace}/env.custom" ]]; then
 		log_error "Security: Symbolic links are not allowed in workspace path: env.custom"
+		exit 1
+	fi
+	if [[ -e "${workspace}/env.custom" && ! -f "${workspace}/env.custom" ]]; then
+		log_error "Failed to read custom environment file (not a regular file): ${workspace}/env.custom"
 		exit 1
 	fi
 	if [[ -f "${workspace}/env.custom" && ! -r "${workspace}/env.custom" ]]; then
@@ -910,10 +928,15 @@ extract_dockerfile_workdir() {
 	local stage_wd=""
 	local stage_invalid=false
 	local current_stage=""
+	local eof_reached=false
 	local -A stage_wds=()
 	local -A stage_invalids=()
 
-	while IFS= read -r line || [[ -n $line ]]; do
+	while [[ $eof_reached == false ]]; do
+		if ! IFS= read -r line; then
+			eof_reached=true
+			[[ -z $line && -z $logical_line ]] && break
+		fi
 		line="${line%$'\r'}"
 
 		# Skip lines inside an active BuildKit heredoc body until its closing delimiter
@@ -931,13 +954,16 @@ extract_dockerfile_workdir() {
 
 		# Comments inside backslash continuations do not terminate the continuation in Docker
 		if [[ $trimmed == "#"* ]]; then
-			continue
+			[[ $eof_reached == true && -n $logical_line ]] || continue
+			trimmed=""
 		fi
 
-		# Join unescaped trailing-backslash continuation lines
-		if [[ ! $trimmed =~ \\\\[[:space:]]*$ ]] && [[ $trimmed =~ ^(.*)\\[[:space:]]*$ ]]; then
-			logical_line+="${BASH_REMATCH[1]} "
+		# Join unescaped trailing-backslash continuation lines (supports odd numbers of trailing '\')
+		if [[ $eof_reached == false ]] && [[ $trimmed =~ ^(.*[^\\]|)(\\\\)*\\[[:space:]]*$ ]]; then
+			logical_line+="${BASH_REMATCH[1]}${BASH_REMATCH[2]} "
 			continue
+		elif [[ $eof_reached == true ]] && [[ $trimmed =~ ^(.*[^\\]|)(\\\\)*\\[[:space:]]*$ ]]; then
+			trimmed="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
 		fi
 		logical_line+="$trimmed"
 		trimmed="$logical_line"
@@ -945,11 +971,10 @@ extract_dockerfile_workdir() {
 
 		[[ -z $trimmed ]] && continue
 
-		# Detect BuildKit heredoc start on non-FROM/WORKDIR instructions (e.g., RUN <<EOF, COPY <<-EOF)
-		if [[ ! $trimmed =~ ^([Ff][Rr][Oo][Mm]|[Ww][Oo][Rr][Kk][Dd][Ii][Rr])[[:space:]] ]] \
-			&& [[ $trimmed =~ ^[A-Za-z]+[[:space:]].*\<\<(-?)[[:space:]]*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]? ]]; then
-			heredoc_delim="${BASH_REMATCH[2]}"
-			if [[ ${BASH_REMATCH[1]} == "-" ]]; then
+		# Detect BuildKit heredoc start on RUN/COPY/ADD instructions (exclude '<<<' here-strings and mid-expression '<<')
+		if [[ $trimmed =~ ^([Rr][Uu][Nn]|[Cc][Oo][Pp][Yy]|[Aa][Dd][Dd])([[:space:]].*[^<]|[[:space:]])\<\<(-?)[[:space:]]*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]?([[:space:]]*(>[>]?[[:space:]]*[^[:space:]\'\"]+|[[:space:]]+/[^[:space:]\'\"]*))?[[:space:]]*$ ]]; then
+			heredoc_delim="${BASH_REMATCH[4]}"
+			if [[ ${BASH_REMATCH[3]} == "-" ]]; then
 				heredoc_strip_tabs=true
 			else
 				heredoc_strip_tabs=false

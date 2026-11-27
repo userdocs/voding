@@ -302,6 +302,17 @@ fi
 run_test "missing parent dir for GITHUB_OUTPUT exits 1" 1 \
 	GITHUB_OUTPUT="${tmp_dir}/no_such_dir/gh_out"
 
+# Named pipe (FIFO) at GITHUB_ENV must exit 1 immediately without blocking
+mkfifo "${tmp_dir}/fifo_gh_env"
+run_test "named pipe (FIFO) GITHUB_ENV exits 1" 1 \
+	GITHUB_ENV="${tmp_dir}/fifo_gh_env"
+
+# /dev/null is accepted for GITHUB_ENV, GITHUB_OUTPUT, and GITHUB_STEP_SUMMARY
+run_test "/dev/null accepted for GITHUB_ENV, GITHUB_OUTPUT, and GITHUB_STEP_SUMMARY" 0 \
+	GITHUB_ENV="/dev/null" \
+	GITHUB_OUTPUT="/dev/null" \
+	GITHUB_STEP_SUMMARY="/dev/null"
+
 #─────────────────────────────────────────────────────
 section "Platform Validation"
 #─────────────────────────────────────────────────────
@@ -587,6 +598,20 @@ invoke_script \
 	MOCK_BUILDX_JSON='{"image":{"attestation-manifest":{},"linux/amd64":{"config":{"Labels":{"org.opencontainers.image.base.id":"debian"}}}}}'
 assert_dockerfile "multi-arch Buildx JSON skips empty attestation entry -> apt-get" "apt-get update"
 
+# Userdocs base.name with port-qualified registry and @sha256 digest extracts OS accurately
+invoke_script \
+	inputs_os_id="ghcr.io/userdocs/qbt-nox" \
+	inputs_os_version_id="latest" \
+	MOCK_BUILDX_JSON='{"image":{"config":{"Labels":{"org.opencontainers.image.base.name":"registry.local:5000/library/ubuntu@sha256:deadbeef"}}}}'
+assert_dockerfile "userdocs base.name with registry:port and @sha256 -> apt-get" "apt-get update"
+
+# Official .name pinned by @sha256 digest extracts OS accurately
+invoke_script \
+	inputs_os_id="custom/mystery" \
+	inputs_os_version_id="latest" \
+	MOCK_BUILDX_JSON='{"name":"docker.io/library/debian@sha256:deadbeef","image":{"config":{"Labels":{}}}}'
+assert_dockerfile "official .name with @sha256 digest -> apt-get" "apt-get"
+
 #─────────────────────────────────────────────────────
 section "Additional Apps in Dockerfile"
 #─────────────────────────────────────────────────────
@@ -788,11 +813,16 @@ else
 	_fail "stale env.load was not removed or was passed to docker" "$(docker_log)"
 fi
 
-# Directory collision at env.load fails upfront before docker build
+# Directory collision at env.load or env.custom fails upfront before docker build
 _ws_dir_envload="${tmp_dir}/ws_dir_envload"
 mkdir -p "${_ws_dir_envload}/env.load"
 run_test "directory collision at env.load exits 1" 1 \
 	--workspace "$_ws_dir_envload"
+
+_ws_dir_envcustom="${tmp_dir}/ws_dir_envcustom"
+mkdir -p "${_ws_dir_envcustom}/env.custom"
+run_test "directory at env.custom exits 1" 1 \
+	--workspace "$_ws_dir_envcustom"
 
 #─────────────────────────────────────────────────────
 section "Custom Docker Commands"
@@ -869,6 +899,18 @@ run_test "docker.sock/ trailing-slash mount in --volume exits 1" 1 \
 
 run_test "host root filesystem mount (/:/host) in --volume exits 1" 1 \
 	inputs_custom_docker_commands="--volume /:/host"
+
+run_test "single-dot host root filesystem mount (/.:/host) in --volume exits 1" 1 \
+	inputs_custom_docker_commands="--volume /.:/host"
+
+run_test "slash-dot-slash host rootfs mount (/./:/host) in --volume exits 1" 1 \
+	inputs_custom_docker_commands="--volume /./:/host"
+
+run_test "container root mount with options (/tmp:/:ro) in --volume exits 1" 1 \
+	inputs_custom_docker_commands="--volume /tmp:/:ro"
+
+run_test "valid hidden dot-directory mount (/tmp/.cache:/app/.cache:ro) is accepted" 0 \
+	inputs_custom_docker_commands="--volume /tmp/.cache:/app/.cache:ro"
 
 run_test "relative container mount destination in --volume exits 1" 1 \
 	inputs_custom_docker_commands="--volume /tmp:relative_dest"
@@ -1027,6 +1069,21 @@ HEREDOC
 EOF
 invoke_script --workspace "$_ws_df" inputs_dockerfile="heredoc.Dockerfile"
 assert_gh_output "multiline FROM and BuildKit <<HEREDOC preserve real WORKDIR" "wd=/heredoc_safe"
+
+# Bash <<< here-string and << bitshift inside RUN must NOT falsely open a BuildKit heredoc
+cat > "${_ws_df}/herestring_bitshift.Dockerfile" << 'EOF'
+FROM alpine:edge
+RUN bash -c 'read -r x <<< "hello"'
+RUN python3 -c 'shift = 2; print(1 << shift)'
+WORKDIR /after_herestring
+EOF
+invoke_script --workspace "$_ws_df" inputs_dockerfile="herestring_bitshift.Dockerfile"
+assert_gh_output "<<< here-string and << bitshift do not swallow subsequent WORKDIR" "wd=/after_herestring"
+
+# Dangling trailing backslash at EOF still evaluates final WORKDIR instruction
+printf 'FROM alpine:edge\nWORKDIR /dangling_eof \134' > "${_ws_df}/dangling.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="dangling.Dockerfile"
+assert_gh_output "dangling trailing backslash at EOF preserves WORKDIR" "wd=/dangling_eof"
 
 # Adversarial FROM token with brackets/command-like syntax cannot trigger array subscript errors or command execution
 # shellcheck disable=SC2016
