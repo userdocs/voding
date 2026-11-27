@@ -147,9 +147,13 @@ validate_input() {
 
 	case "$type" in
 		"docker_arg")
-			# Only allow safe docker arguments - whitelist approach
+			# Only allow safe docker arguments - whitelist approach (redact inline =value on error)
 			if [[ ! $input =~ ^(-[evuw]|--env|--volume|--user|--workdir|--memory|--cpus)$ ]]; then
-				log_error "Security: Invalid docker argument blocked: $input"
+				if [[ $input == *=* ]]; then
+					log_error "Security: Invalid docker argument blocked: ${input%%=*}=<redacted>"
+				else
+					log_error "Security: Invalid docker argument blocked: $input"
+				fi
 				exit 1
 			fi
 			;;
@@ -256,6 +260,10 @@ validate_workspace_file() {
 	if [[ ! -f $current_path ]]; then
 		return 2
 	fi
+	if [[ ! -r $current_path ]]; then
+		log_error "Failed to read workspace file (not readable): $rel_path"
+		return 1
+	fi
 
 	parent_dir="${current_path%/*}"
 	[[ -z $parent_dir ]] && parent_dir="/"
@@ -337,6 +345,7 @@ validate_gh_file_target() {
 # Validate basic inputs
 validate_basic_inputs() {
 	local LC_ALL=C
+	local ws_real
 
 	# Validate boolean inputs
 	if [[ ! $inputs_use_host_env =~ ^(true|false)$ ]]; then
@@ -348,9 +357,14 @@ validate_basic_inputs() {
 		exit 1
 	fi
 
-	# Validate workspace directory (must be an existing absolute host path without ':' or newlines)
+	# Validate workspace directory (must be an existing non-root absolute host path without ':' or newlines)
 	if [[ -z $workspace || $workspace != /* || ! -d $workspace || $workspace == *:* || $workspace == *$'\n'* || $workspace == *$'\r'* ]]; then
 		log_error "Security: Invalid or missing workspace directory: $workspace"
+		exit 1
+	fi
+	ws_real=$(cd -P -- "$workspace" 2> /dev/null && pwd -P) || ws_real=""
+	if [[ -z $ws_real || $ws_real == "/" ]]; then
+		log_error "Security: Invalid or root workspace directory: $workspace"
 		exit 1
 	fi
 
@@ -428,9 +442,9 @@ detect_image_os() {
 	printf '%s' "$detected_os"
 }
 
-# jq expression selecting the matching platform image object (or first valid platform) from buildx imagetools JSON
+# jq expression selecting the matching platform image object (including arm64 <-> arm64/v8 alias, or first valid platform) from buildx imagetools JSON
 # shellcheck disable=SC2016
-_jq_image_selector='(.image | if type == "object" and (has("config") or has("history")) then . elif ($plat != "" and (.[$plat] | type == "object" and (has("config") or has("history")))) then .[$plat] else ([.[]? | select(type == "object" and (has("config") or has("history")))][0] // {}) end)'
+_jq_image_selector='(($plat | if . == "linux/arm64" then "linux/arm64/v8" elif . == "linux/arm64/v8" then "linux/arm64" else "" end) as $alt_plat | .image | if type == "object" and (has("config") or has("history")) then . elif ($plat != "" and (.[$plat] | type == "object" and (has("config") or has("history")))) then .[$plat] elif ($alt_plat != "" and (.[$alt_plat] | type == "object" and (has("config") or has("history")))) then .[$alt_plat] else ([.[]? | select(type == "object" and (has("config") or has("history")))][0] // {}) end)'
 
 # Section 1: GHCR userdocs-specific metadata parsing
 detect_os_userdocs() {
@@ -687,6 +701,7 @@ setup_platform() {
 
 # Filter valid env vars from stdin to stdout, blocking dangerous entries
 _sanitize_env_stream() {
+	local LC_ALL=C
 	local line
 
 	while IFS= read -r line || [[ -n $line ]]; do
@@ -694,11 +709,12 @@ _sanitize_env_stream() {
 		[[ -z ${line//[[:space:]]/} || $line =~ ^[[:space:]]*# ]] && continue
 		# Use centralized validation without subshell fork
 		if check_env_var "$line"; then
-			printf '%s\n' "$line"
+			printf '%s\n' "$line" || return 1
 		else
 			log_error "Security: Invalid environment variable blocked: $(redact_env_var "$line")"
 		fi
 	done
+	return 0
 }
 
 # Sanitize environment files
@@ -750,7 +766,9 @@ process_environment() {
 		(
 			umask 077
 			while IFS= read -r -d '' entry; do
-				[[ $entry != *$'\n'* && $entry != *$'\r'* ]] && printf '%s\n' "$entry"
+				if [[ $entry != *$'\n'* && $entry != *$'\r'* ]]; then
+					printf '%s\n' "$entry" || exit 1
+				fi
 			done < <(env -0) > "${workspace}/env.host"
 		) || {
 			log_error "Failed to write host environment to ${workspace}/env.host"
@@ -764,8 +782,8 @@ process_environment() {
 		(
 			umask 077
 			{
-				_sanitize_env_stream < "${workspace}/env.host"
-				_sanitize_env_stream < "${workspace}/env.custom"
+				_sanitize_env_stream < "${workspace}/env.host" \
+					&& _sanitize_env_stream < "${workspace}/env.custom"
 			} > "${workspace}/env.load"
 		) || {
 			log_error "Failed to write merged environment to ${workspace}/env.load"
@@ -912,7 +930,11 @@ parse_docker_commands() {
 
 			clean_envs+=("$_flag" "$_val")
 		else
-			log_error "Security: Invalid docker command format blocked: $e_trim"
+			if [[ $e_trim == *=* ]]; then
+				log_error "Security: Invalid docker command format blocked: ${e_trim%%=*}=<redacted>"
+			else
+				log_error "Security: Invalid docker command format blocked: $e_trim"
+			fi
 			exit 1
 		fi
 	done
@@ -938,6 +960,8 @@ extract_dockerfile_workdir() {
 	local eof_reached=false
 	local -A stage_wds=()
 	local -A stage_invalids=()
+	local run_heredoc_re="^([Rr][Uu][Nn])([[:space:]].*[^<]|[[:space:]])<<(-?)[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?([[:space:]]*(>[>]?[[:space:]]*[^[:space:]'\"]+))?[[:space:]]*\$"
+	local copy_heredoc_re="^([Cc][Oo][Pp][Yy]|[Aa][Dd][Dd])([[:space:]].*[^<]|[[:space:]])<<(-?)[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?[[:space:]]+(['\"][^'\"]+['\"]|[^[:space:]'\"]+)[[:space:]]*\$"
 
 	while [[ $eof_reached == false ]]; do
 		if ! IFS= read -r line; then
@@ -979,7 +1003,7 @@ extract_dockerfile_workdir() {
 		[[ -z $trimmed ]] && continue
 
 		# Detect BuildKit heredoc start on RUN/COPY/ADD instructions (exclude '<<<' here-strings and mid-expression '<<')
-		if [[ $trimmed =~ ^([Rr][Uu][Nn]|[Cc][Oo][Pp][Yy]|[Aa][Dd][Dd])([[:space:]].*[^<]|[[:space:]])\<\<(-?)[[:space:]]*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]?([[:space:]]*(>[>]?[[:space:]]*[^[:space:]\'\"]+|[[:space:]]+/[^[:space:]\'\"]*))?[[:space:]]*$ ]]; then
+		if [[ $trimmed =~ $run_heredoc_re || $trimmed =~ $copy_heredoc_re ]]; then
 			heredoc_delim="${BASH_REMATCH[4]}"
 			if [[ ${BASH_REMATCH[3]} == "-" ]]; then
 				heredoc_strip_tabs=true
@@ -1376,14 +1400,19 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 			exit 1
 		fi
 
-		# Write Dockerfile to stdout and step summary for visibility
+		# Write Dockerfile to stdout and step summary for visibility (ensuring trailing newline before closing fence)
+		dockerfile_content=$(< "$dockerfile_path") || {
+			log_error "Failed to read Dockerfile: $dockerfile_path"
+			[[ $cleanup_dockerfile == true ]] && rm -f "$dockerfile_path"
+			exit 1
+		}
 		log_info "Using Dockerfile: $dockerfile_path"
-		cat "$dockerfile_path"
+		printf '%s\n' "$dockerfile_content"
 		if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
 			{
 				log_info "Using Dockerfile: $dockerfile_path"
 				printf '%b\n' '```bash'
-				cat "$dockerfile_path"
+				printf '%s\n' "$dockerfile_content"
 				printf '%b\n' '```'
 			} >> "$GITHUB_STEP_SUMMARY" || {
 				log_error "Failed to write to GITHUB_STEP_SUMMARY"
@@ -1496,11 +1525,16 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		rm -f "$dockerfile_path"
 		exit 1
 	fi
-	cat "$dockerfile_path"
+	dockerfile_content=$(< "$dockerfile_path") || {
+		log_error "Failed to read Dockerfile: $dockerfile_path"
+		rm -f "$dockerfile_path"
+		exit 1
+	}
+	printf '%s\n' "$dockerfile_content"
 	if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
 		{
 			printf '%b\n' '```bash'
-			cat "$dockerfile_path"
+			printf '%s\n' "$dockerfile_content"
 			printf '%b\n' '```'
 		} >> "$GITHUB_STEP_SUMMARY" || {
 			log_error "Failed to write to GITHUB_STEP_SUMMARY"

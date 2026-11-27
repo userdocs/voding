@@ -266,6 +266,12 @@ run_test "workspace path containing colon exits 1" 1 \
 run_test "relative workspace path exits 1" 1 \
 	--workspace "relative_ws_dir"
 
+run_test "root workspace path (/) exits 1" 1 \
+	--workspace "/"
+
+run_test "workspace resolving to / (/.) exits 1" 1 \
+	--workspace "/."
+
 # Symlinked GITHUB_ENV / GITHUB_OUTPUT / GITHUB_STEP_SUMMARY must be rejected without clobbering targets
 printf 'KEEP_SAFE\n' > "${tmp_dir}/sym_gh_target"
 ln -sf "${tmp_dir}/sym_gh_target" "${tmp_dir}/sym_gh_env"
@@ -620,6 +626,14 @@ invoke_script \
 	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{"org.opencontainers.image.base.id":"alpine"}}},"linux/arm64":{"config":{"Labels":{"org.opencontainers.image.base.id":"debian"}}}}}'
 assert_dockerfile "multi-arch Buildx JSON selects matching inputs_platform (linux/arm64 -> debian)" "apt-get update"
 
+# Multi-arch Buildx JSON maps linux/arm64 (RUNNER_ARCH=ARM64) to linux/arm64/v8 OCI variant manifest
+invoke_script \
+	RUNNER_ARCH="ARM64" \
+	inputs_os_id="ghcr.io/userdocs/qbt-nox" \
+	inputs_os_version_id="latest" \
+	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{"org.opencontainers.image.base.id":"alpine"}}},"linux/arm64/v8":{"config":{"Labels":{"org.opencontainers.image.base.id":"debian"}}}}}'
+assert_dockerfile "multi-arch Buildx JSON maps linux/arm64 to linux/arm64/v8 manifest" "apt-get update"
+
 #─────────────────────────────────────────────────────
 section "Additional Apps in Dockerfile"
 #─────────────────────────────────────────────────────
@@ -751,6 +765,23 @@ printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "inputs_use_host_env=true 
 if [[ -f "${_ws_host}/env.host" ]]; then
 	_pass
 else _fail "env.host was not created" "$(last_output)"; fi
+
+# inputs_use_host_env=true succeeds when final env -0 entry contains newlines
+_ws_host_ml="${tmp_dir}/ws_host_ml"
+mkdir -p "$_ws_host_ml"
+invoke_script \
+	--workspace "$_ws_host_ml" \
+	inputs_use_host_env="true" \
+	inputs_additional_apps=$'curl\nwget' \
+	ZZZ_TRAILING_MULTILINE=$'line1\nline2'
+_rc=$?
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "inputs_use_host_env=true succeeds when trailing env var is multiline"
+if [[ $_rc -eq 0 && -s "${_ws_host_ml}/env.host" ]] \
+	&& ! grep -qF "ZZZ_TRAILING_MULTILINE" "${_ws_host_ml}/env.host" 2> /dev/null; then
+	_pass
+else
+	_fail "multiline trailing env var caused host env dump failure (rc=$_rc)" "$(last_output)"
+fi
 
 # Combined inputs_use_host_env=true + env.custom merges both and removes .safe intermediates
 _ws_both="${tmp_dir}/ws_both"
@@ -956,6 +987,17 @@ else
 	_fail '--env $ expansion error leaked plaintext secret' "$(last_output)"
 fi
 
+# --env=KEY=VAL inline syntax exits 1 and redacts secret value in error output
+run_test "--env=KEY=VAL inline syntax exits 1" 1 \
+	inputs_custom_docker_commands="--env=MY_INLINE_SECRET=top_secret_inline_999"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "--env=KEY=VAL blocked arg redacts secret value in error output"
+if grep -qF -- "--env=<redacted>" "${tmp_dir}/last_output" \
+	&& ! grep -qF "top_secret_inline_999" "${tmp_dir}/last_output"; then
+	_pass
+else
+	_fail "--env=KEY=VAL error leaked plaintext secret" "$(last_output)"
+fi
+
 run_test "extra flag smuggled on --volume line exits 1" 1 \
 	inputs_custom_docker_commands="--volume /tmp:/tmp --privileged"
 
@@ -1126,6 +1168,19 @@ EOF
 invoke_script --workspace "$_ws_df" inputs_dockerfile="heredoc.Dockerfile"
 assert_gh_output "multiline FROM and BuildKit <<HEREDOC preserve real WORKDIR" "wd=/heredoc_safe"
 
+# BuildKit COPY <<'EOF' with relative destination ignores heredoc WORKDIR/FROM
+cat > "${_ws_df}/copy_heredoc.Dockerfile" << 'EOF'
+FROM alpine:edge
+WORKDIR /app_rel_copy
+COPY --chmod=0755 <<'EOF_SCRIPT' entrypoint.sh
+#!/bin/sh
+WORKDIR /wrong_copy_wd
+FROM scratch
+EOF_SCRIPT
+EOF
+invoke_script --workspace "$_ws_df" inputs_dockerfile="copy_heredoc.Dockerfile"
+assert_gh_output "BuildKit COPY <<EOF with relative destination preserves WORKDIR" "wd=/app_rel_copy"
+
 # Bash <<< here-string and << bitshift inside RUN must NOT falsely open a BuildKit heredoc
 cat > "${_ws_df}/herestring_bitshift.Dockerfile" << 'EOF'
 FROM alpine:edge
@@ -1140,6 +1195,12 @@ assert_gh_output "<<< here-string and << bitshift do not swallow subsequent WORK
 printf 'FROM alpine:edge\nWORKDIR /dangling_eof \134' > "${_ws_df}/dangling.Dockerfile"
 invoke_script --workspace "$_ws_df" inputs_dockerfile="dangling.Dockerfile"
 assert_gh_output "dangling trailing backslash at EOF preserves WORKDIR" "wd=/dangling_eof"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "Dockerfile without trailing newline preserves closing code fence in GITHUB_STEP_SUMMARY"
+if [[ $(grep -Fcx -- $'\x60\x60\x60' "${tmp_dir}/gh_summary" 2> /dev/null) -eq 2 ]]; then
+	_pass
+else
+	_fail "closing Markdown code fence corrupted in GITHUB_STEP_SUMMARY" "$(cat "${tmp_dir}/gh_summary" 2> /dev/null)"
+fi
 
 # Adversarial FROM token with brackets/command-like syntax cannot trigger array subscript errors or command execution
 # shellcheck disable=SC2016
