@@ -14,6 +14,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 pass_count=0
 fail_count=0
+last_rc=0
 
 #=============================================================================
 # TEST HELPERS
@@ -86,6 +87,8 @@ invoke_script() {
 		inputs_use_root="false" \
 		"${extra_env[@]}" \
 		bash "$script_path" > "${tmp_dir}/last_output" 2>&1
+	last_rc=$?
+	return "$last_rc"
 }
 
 last_output() { cat "${tmp_dir}/last_output"; }
@@ -107,65 +110,68 @@ run_test() {
 	fi
 }
 
-# Assert stdout/stderr of an invoke_script call contains a grep pattern.
-assert_output() {
+# Assert invoke_script exits 1 and stdout/stderr contains a grep pattern.
+assert_fail_output() {
 	local name="$1"
 	local pattern="$2"
 	shift 2
 	printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "$name"
 	invoke_script "$@"
+	local actual=$?
 	local plain
 	plain=$(last_output | sed 's/\x1b\[[0-9;]*m//g')
-	if printf '%s' "$plain" | grep -q -- "$pattern"; then
+	if [[ $actual -eq 1 ]] && printf '%s' "$plain" | grep -q -- "$pattern"; then
 		_pass
 	else
-		_fail "output did not contain: $pattern" "$plain"
+		_fail "expected exit 1 (got $actual) with pattern: $pattern" "$plain"
 	fi
 }
 
-# Post-invoke: assert GITHUB_OUTPUT contains an exact string.
+# Post-invoke: assert last invoke_script exited 0 and GITHUB_OUTPUT contains an exact string.
 assert_gh_output() {
 	local name="$1"
 	local pattern="$2"
 	printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "$name"
-	if grep -qF -- "$pattern" "${tmp_dir}/gh_output" 2> /dev/null; then
+	if [[ $last_rc -eq 0 ]] && grep -qF -- "$pattern" "${tmp_dir}/gh_output" 2> /dev/null; then
 		_pass
 	else
-		_fail "GITHUB_OUTPUT did not contain: $pattern" "$(cat "${tmp_dir}/gh_output" 2> /dev/null)"
+		_fail "GITHUB_OUTPUT check failed (rc=$last_rc) for: $pattern" "$(cat "${tmp_dir}/gh_output" 2> /dev/null)"
 	fi
 }
 
-# Post-invoke: assert docker_calls.log contains a substring.
+# Post-invoke: assert last invoke_script exited 0 and docker_calls.log contains a substring.
 assert_docker() {
 	local name="$1"
 	local pattern="$2"
 	printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "$name"
 	# Use -- to prevent grep treating patterns like '--env-file' as options.
-	if grep -qF -- "$pattern" "${tmp_dir}/docker_calls.log" 2> /dev/null; then
+	if [[ $last_rc -eq 0 ]] && grep -qF -- "$pattern" "${tmp_dir}/docker_calls.log" 2> /dev/null; then
 		_pass
 	else
-		_fail "docker was not called with: $pattern" "$(docker_log)"
+		_fail "docker check failed (rc=$last_rc) for: $pattern" "$(docker_log)"
 	fi
 }
 
-# Post-invoke: assert the saved Dockerfile contains a pattern.
+# Post-invoke: assert last invoke_script exited 0 and the saved Dockerfile contains a pattern.
 assert_dockerfile() {
 	local name="$1"
 	local pattern="$2"
 	printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "$name"
-	if [[ -f "${tmp_dir}/last_dockerfile" ]] && grep -qE -- "$pattern" "${tmp_dir}/last_dockerfile" 2> /dev/null; then
+	if [[ $last_rc -eq 0 && -f "${tmp_dir}/last_dockerfile" ]] && grep -qE -- "$pattern" "${tmp_dir}/last_dockerfile" 2> /dev/null; then
 		_pass
 	else
-		_fail "Dockerfile did not contain: $pattern" "$(cat "${tmp_dir}/last_dockerfile" 2> /dev/null)"
+		_fail "Dockerfile check failed (rc=$last_rc) for: $pattern" "$(cat "${tmp_dir}/last_dockerfile" 2> /dev/null)"
 	fi
 }
 
-# Post-invoke: assert the saved Dockerfile exists and does NOT contain a pattern.
+# Post-invoke: assert last invoke_script exited 0 and the saved Dockerfile does NOT contain a pattern.
 assert_not_dockerfile() {
 	local name="$1"
 	local pattern="$2"
 	printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "$name"
-	if [[ ! -f "${tmp_dir}/last_dockerfile" ]]; then
+	if [[ $last_rc -ne 0 ]]; then
+		_fail "invoke_script failed with exit $last_rc" "$(last_output)"
+	elif [[ ! -f "${tmp_dir}/last_dockerfile" ]]; then
 		_fail "Dockerfile was not captured (build may not have run)" "$(last_output)"
 	elif ! grep -qE -- "$pattern" "${tmp_dir}/last_dockerfile" 2> /dev/null; then
 		_pass
@@ -229,7 +235,7 @@ run_test "inputs_use_host_env=TRUE exits 1" 1 \
 run_test "inputs_use_root=1 exits 1" 1 \
 	inputs_use_root="1"
 
-assert_output "boolean error message names the expected values" "must be 'true' or 'false'" \
+assert_fail_output "boolean error message names the expected values" "must be 'true' or 'false'" \
 	inputs_use_host_env="yes"
 
 #─────────────────────────────────────────────────────
@@ -382,7 +388,7 @@ run_test "https remote Dockerfile exits 1" 1 \
 run_test "file:// URI Dockerfile exits 1" 1 \
 	inputs_dockerfile="file:///etc/passwd"
 
-assert_output "uppercase HTTPS:// remote Dockerfile blocked as remote" "Remote Dockerfiles not allowed" \
+assert_fail_output "uppercase HTTPS:// remote Dockerfile blocked as remote" "Remote Dockerfiles not allowed" \
 	inputs_dockerfile="HTTPS://evil.example.com/Dockerfile"
 
 run_test "missing Dockerfile exits 1" 1 \
@@ -419,7 +425,7 @@ run_test "Dockerfile filename with consecutive dots is accepted" 0 \
 	inputs_dockerfile="my..Dockerfile"
 
 # Trailing slash or bare '.' on inputs_dockerfile is rejected as an invalid dockerfile path
-assert_output "trailing slash on inputs_dockerfile blocked" "Invalid dockerfile path blocked" \
+assert_fail_output "trailing slash on inputs_dockerfile blocked" "Invalid dockerfile path blocked" \
 	--workspace "$_ws_df" \
 	inputs_dockerfile="my.Dockerfile/"
 
@@ -898,7 +904,7 @@ assert_docker "short and resource flags passed to docker run" "-e SHORT_VAR=1 --
 run_test "unrecognised docker arg exits 1" 1 \
 	inputs_custom_docker_commands="--rm"
 
-assert_output "invalid docker arg produces security message" "Security" \
+assert_fail_output "invalid docker arg produces security message" "Security" \
 	inputs_custom_docker_commands="--rm"
 
 run_test "bare docker arg without value exits 1" 1 \
@@ -1212,6 +1218,20 @@ EOF
 invoke_script --workspace "$_ws_df" inputs_dockerfile="pipe_heredoc.Dockerfile"
 assert_gh_output "BuildKit piped RUN <<EOF | sh preserves WORKDIR" "wd=/app_pipe_ok"
 
+# BuildKit tab-stripped <<-'EOF_TAB' with chained quoted command preserves WORKDIR
+printf 'FROM alpine:edge\nWORKDIR /app_tab_ok\nRUN cat <<-'\''EOF_TAB'\'' > /tmp/x && printf "done\\n"\n\tWORKDIR /wrong_tab_wd\n\tFROM scratch\n\t\tEOF_TAB\n' > "${_ws_df}/tab_heredoc.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="tab_heredoc.Dockerfile"
+assert_gh_output "BuildKit tab-stripped <<-EOF with chained quoted command preserves WORKDIR" "wd=/app_tab_ok"
+
+# Quoted '<<EOF' or "<<EOF" literals inside RUN must NOT open an unclosed BuildKit heredoc
+cat > "${_ws_df}/quoted_literal_heredoc.Dockerfile" << 'EOF'
+FROM alpine:edge
+RUN grep -q '<<EOF' /etc/passwd || printf '%s\n' "<<EOF"
+WORKDIR /after_quoted_marker
+EOF
+invoke_script --workspace "$_ws_df" inputs_dockerfile="quoted_literal_heredoc.Dockerfile"
+assert_gh_output "quoted '<<EOF' and \"<<EOF\" literals do not swallow subsequent WORKDIR" "wd=/after_quoted_marker"
+
 # Bash <<< here-string and << bitshift inside RUN must NOT falsely open a BuildKit heredoc
 cat > "${_ws_df}/herestring_bitshift.Dockerfile" << 'EOF'
 FROM alpine:edge
@@ -1415,6 +1435,29 @@ if (
 	_pass
 else
 	_fail "validation/parsing functions mutated caller LC_ALL/IFS or failed under custom IFS" ""
+fi
+
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "Dockerfile generators and log formatters join arrays with spaces under custom IFS"
+if (
+	# shellcheck source=/dev/null
+	source "$script_path" 2> /dev/null
+	# shellcheck disable=SC2034
+	inputs_additional_apps="curl git"
+	# shellcheck disable=SC2034
+	inputs_custom_docker_commands="$(printf -- '-e MY_KEY=secret\n--memory 2g\n')"
+	parse_docker_commands
+	IFS=":"
+	_std_df=$(generate_standard_dockerfile "alpine")
+	_ud_df=$(generate_userdocs_dockerfile "debian")
+	_fmt_log=$(format_clean_envs_for_log)
+	[[ $_std_df == *"sudo bash curl git"* ]] \
+		&& [[ $_ud_df == *"apt-get install -y curl git"* ]] \
+		&& [[ $_fmt_log == "-e MY_KEY=<redacted> --memory 2g" ]] \
+		&& [[ $IFS == ":" ]]
+); then
+	_pass
+else
+	_fail "Dockerfile generator or log formatter joined array with caller IFS instead of spaces" ""
 fi
 
 printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "validate_workspace_file standalone rejects .. traversal and trailing slash with rc=1"

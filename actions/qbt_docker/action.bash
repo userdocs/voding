@@ -93,6 +93,7 @@ redact_env_var() {
 
 # Format clean_envs for safe logging/summaries while redacting -e / --env values
 format_clean_envs_for_log() {
+	local IFS=' '
 	local -a formatted=()
 	local i=0
 	local flag
@@ -939,6 +940,91 @@ parse_docker_commands() {
 	done
 }
 
+# Scan a logical RUN/COPY/ADD line for an unquoted BuildKit <<[-]DELIM heredoc.
+# Sets caller's heredoc_delim and heredoc_strip_tabs and returns 0 if found; returns 1 otherwise.
+_extract_heredoc_delim() {
+	local LC_ALL=C
+	local s="$1"
+	local i=0
+	local len=${#s}
+	local ch
+	local in_sq=false
+	local in_dq=false
+	local paren_depth=0
+	local strip_tabs=false
+	local quote_ch=""
+	local delim=""
+
+	[[ $s == *"<<"* ]] || return 1
+	[[ $s =~ ^([Rr][Uu][Nn]|[Cc][Oo][Pp][Yy]|[Aa][Dd][Dd])[[:space:]] ]] || return 1
+
+	while [[ $i -lt $len ]]; do
+		ch="${s:i:1}"
+		if [[ $in_sq == true ]]; then
+			[[ $ch == "'" ]] && in_sq=false
+			i=$((i + 1))
+			continue
+		fi
+		if [[ $in_dq == true ]]; then
+			if [[ $ch == $'\\' ]]; then
+				i=$((i + 2))
+				continue
+			fi
+			[[ $ch == '"' ]] && in_dq=false
+			i=$((i + 1))
+			continue
+		fi
+		case "$ch" in
+			\\)
+				i=$((i + 2))
+				continue
+				;;
+			\')
+				in_sq=true
+				;;
+			\")
+				in_dq=true
+				;;
+			\()
+				paren_depth=$((paren_depth + 1))
+				;;
+			\))
+				[[ $paren_depth -gt 0 ]] && paren_depth=$((paren_depth - 1))
+				;;
+			\<)
+				if [[ $paren_depth -eq 0 && ${s:i:2} == "<<" && ${s:i:3} != "<<<" ]]; then
+					if [[ $i -eq 0 || ${s:i-1:1} != "<" ]]; then
+						i=$((i + 2))
+						if [[ ${s:i:1} == "-" ]]; then
+							strip_tabs=true
+							i=$((i + 1))
+						fi
+						while [[ $i -lt $len && (${s:i:1} == " " || ${s:i:1} == $'\t') ]]; do
+							i=$((i + 1))
+						done
+						if [[ ${s:i:1} == "'" || ${s:i:1} == '"' ]]; then
+							quote_ch="${s:i:1}"
+							i=$((i + 1))
+						fi
+						while [[ $i -lt $len && ${s:i:1} =~ [A-Za-z0-9_] ]]; do
+							delim+="${s:i:1}"
+							i=$((i + 1))
+						done
+						if [[ $delim =~ ^[A-Za-z_] ]] && [[ -z $quote_ch || ${s:i:1} == "$quote_ch" ]]; then
+							heredoc_delim="$delim"
+							heredoc_strip_tabs="$strip_tabs"
+							return 0
+						fi
+						return 1
+					fi
+				fi
+				;;
+		esac
+		i=$((i + 1))
+	done
+	return 1
+}
+
 # Extract effective WORKDIR from the final build stage of a Dockerfile.
 # Prints resolved absolute path if present, or empty string if the final stage sets no WORKDIR.
 # Logs a warning and returns 1 if the final stage contains an invalid or path-traversing WORKDIR.
@@ -959,8 +1045,6 @@ extract_dockerfile_workdir() {
 	local eof_reached=false
 	local -A stage_wds=()
 	local -A stage_invalids=()
-	local run_heredoc_re="^([Rr][Uu][Nn])([[:space:]].*[^<]|[[:space:]])<<(-?)[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?([[:space:]]*([0-9]*>[>&]?|&>|\|\|?|&&|;)[^'\"]*)?[[:space:]]*\$"
-	local copy_heredoc_re="^([Cc][Oo][Pp][Yy]|[Aa][Dd][Dd])([[:space:]].*[^<]|[[:space:]])<<(-?)[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?[[:space:]]+(['\"][^'\"]+['\"]|[^[:space:]'\"]+)[[:space:]]*\$"
 
 	while [[ $eof_reached == false ]]; do
 		if ! IFS= read -r line; then
@@ -1001,14 +1085,8 @@ extract_dockerfile_workdir() {
 
 		[[ -z $trimmed ]] && continue
 
-		# Detect BuildKit heredoc start on RUN/COPY/ADD instructions (exclude '<<<' here-strings and mid-expression '<<')
-		if [[ $trimmed =~ $run_heredoc_re || $trimmed =~ $copy_heredoc_re ]]; then
-			heredoc_delim="${BASH_REMATCH[4]}"
-			if [[ ${BASH_REMATCH[3]} == "-" ]]; then
-				heredoc_strip_tabs=true
-			else
-				heredoc_strip_tabs=false
-			fi
+		# Detect unquoted BuildKit heredoc start on RUN/COPY/ADD instructions
+		if _extract_heredoc_delim "$trimmed"; then
 			continue
 		fi
 
@@ -1091,6 +1169,7 @@ extract_dockerfile_workdir() {
 
 # Generate Dockerfile for userdocs images
 generate_userdocs_dockerfile() {
+	local IFS=' '
 	local detected_os="$1"
 	local -a df_lines
 
@@ -1138,6 +1217,7 @@ generate_userdocs_dockerfile() {
 
 # Generate Dockerfile for standard images
 generate_standard_dockerfile() {
+	local IFS=' '
 	local detected_os="$1"
 	local backslash=$'\\'
 	local -a df_lines
@@ -1205,6 +1285,7 @@ generate_standard_dockerfile() {
 #=============================================================================
 
 _inputs_info() {
+	local IFS=' '
 	printf '%b\n' '```bash'
 	log_debug "=== INPUT INFO ==="
 	log_debug ""
