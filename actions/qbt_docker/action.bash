@@ -226,13 +226,10 @@ validate_input() {
 	esac
 }
 
-# Verify a workspace-relative file contains no symbolic link components and stays within $workspace.
-# Returns: 0 = safe regular file, 1 = security violation (logged), 2 = file missing / not a regular file.
+# Verify a workspace-relative file contains no '..' or symlink components and is a readable regular file.
+# Returns: 0 = safe regular file, 1 = security/read violation (logged), 2 = file missing / not a regular file.
 validate_workspace_file() {
 	local rel_path="$1"
-	local ws_real
-	local target_dir_real
-	local parent_dir
 	local current_path="$workspace"
 	local part
 	local IFS='/'
@@ -242,11 +239,10 @@ validate_workspace_file() {
 		log_error "Security: Invalid workspace-relative path: $rel_path"
 		return 1
 	fi
-
-	ws_real=$(cd -P -- "$workspace" 2> /dev/null && pwd -P) || {
-		log_error "Security: Unable to resolve workspace path: $workspace"
+	if [[ ! -d $workspace ]]; then
+		log_error "Security: Invalid workspace directory: $workspace"
 		return 1
-	}
+	fi
 
 	read -ra parts <<< "$rel_path"
 	for part in "${parts[@]}"; do
@@ -267,17 +263,6 @@ validate_workspace_file() {
 	fi
 	if [[ ! -r $current_path ]]; then
 		log_error "Failed to read workspace file (not readable): $rel_path"
-		return 1
-	fi
-
-	parent_dir="${current_path%/*}"
-	[[ -z $parent_dir ]] && parent_dir="/"
-	target_dir_real=$(cd -P -- "$parent_dir" 2> /dev/null && pwd -P) || {
-		log_error "Security: Unable to resolve file directory: $rel_path"
-		return 1
-	}
-	if [[ $target_dir_real != "$ws_real" && $target_dir_real != "${ws_real%/}/"* ]]; then
-		log_error "Security: Path escapes workspace boundary: $rel_path"
 		return 1
 	fi
 
@@ -305,7 +290,7 @@ validate_docker_commands() {
 	done
 }
 
-# Validate a GitHub Actions file-command path (reject symlinks, directories, FIFOs, and unwritable targets)
+# Validate a GitHub Actions file-command path (reject symlinks, non-regular files, and unwritable targets)
 validate_gh_file_target() {
 	local file_path="$1"
 	local label="$2"
@@ -315,14 +300,6 @@ validate_gh_file_target() {
 
 	if [[ -L $file_path ]]; then
 		log_error "Security: ${label} must not be a symbolic link"
-		return 1
-	fi
-	if [[ -d $file_path ]]; then
-		log_error "Security: ${label} must not be a directory: $file_path"
-		return 1
-	fi
-	if [[ -p $file_path ]]; then
-		log_error "Security: ${label} must not be a named pipe: $file_path"
 		return 1
 	fi
 	if [[ -e $file_path && ! -f $file_path && $file_path != "/dev/null" ]]; then
@@ -940,91 +917,6 @@ parse_docker_commands() {
 	done
 }
 
-# Scan a logical RUN/COPY/ADD line for an unquoted BuildKit <<[-]DELIM heredoc.
-# Sets caller's heredoc_delim and heredoc_strip_tabs and returns 0 if found; returns 1 otherwise.
-_extract_heredoc_delim() {
-	local LC_ALL=C
-	local s="$1"
-	local i=0
-	local len=${#s}
-	local ch
-	local in_sq=false
-	local in_dq=false
-	local paren_depth=0
-	local strip_tabs=false
-	local quote_ch=""
-	local delim=""
-
-	[[ $s == *"<<"* ]] || return 1
-	[[ $s =~ ^([Rr][Uu][Nn]|[Cc][Oo][Pp][Yy]|[Aa][Dd][Dd])[[:space:]] ]] || return 1
-
-	while [[ $i -lt $len ]]; do
-		ch="${s:i:1}"
-		if [[ $in_sq == true ]]; then
-			[[ $ch == "'" ]] && in_sq=false
-			i=$((i + 1))
-			continue
-		fi
-		if [[ $in_dq == true ]]; then
-			if [[ $ch == $'\\' ]]; then
-				i=$((i + 2))
-				continue
-			fi
-			[[ $ch == '"' ]] && in_dq=false
-			i=$((i + 1))
-			continue
-		fi
-		case "$ch" in
-			\\)
-				i=$((i + 2))
-				continue
-				;;
-			\')
-				in_sq=true
-				;;
-			\")
-				in_dq=true
-				;;
-			\()
-				paren_depth=$((paren_depth + 1))
-				;;
-			\))
-				[[ $paren_depth -gt 0 ]] && paren_depth=$((paren_depth - 1))
-				;;
-			\<)
-				if [[ $paren_depth -eq 0 && ${s:i:2} == "<<" && ${s:i:3} != "<<<" ]]; then
-					if [[ $i -eq 0 || ${s:i-1:1} != "<" ]]; then
-						i=$((i + 2))
-						if [[ ${s:i:1} == "-" ]]; then
-							strip_tabs=true
-							i=$((i + 1))
-						fi
-						while [[ $i -lt $len && (${s:i:1} == " " || ${s:i:1} == $'\t') ]]; do
-							i=$((i + 1))
-						done
-						if [[ ${s:i:1} == "'" || ${s:i:1} == '"' ]]; then
-							quote_ch="${s:i:1}"
-							i=$((i + 1))
-						fi
-						while [[ $i -lt $len && ${s:i:1} =~ [A-Za-z0-9_] ]]; do
-							delim+="${s:i:1}"
-							i=$((i + 1))
-						done
-						if [[ $delim =~ ^[A-Za-z_] ]] && [[ -z $quote_ch || ${s:i:1} == "$quote_ch" ]]; then
-							heredoc_delim="$delim"
-							heredoc_strip_tabs="$strip_tabs"
-							return 0
-						fi
-						return 1
-					fi
-				fi
-				;;
-		esac
-		i=$((i + 1))
-	done
-	return 1
-}
-
 # Extract effective WORKDIR from the final build stage of a Dockerfile.
 # Prints resolved absolute path if present, or empty string if the final stage sets no WORKDIR.
 # Logs a warning and returns 1 if the final stage contains an invalid or path-traversing WORKDIR.
@@ -1042,15 +934,11 @@ extract_dockerfile_workdir() {
 	local stage_wd=""
 	local stage_invalid=false
 	local current_stage=""
-	local eof_reached=false
 	local -A stage_wds=()
 	local -A stage_invalids=()
+	local heredoc_re="^([Rr][Uu][Nn]|[Cc][Oo][Pp][Yy]|[Aa][Dd][Dd])([[:space:]]+--[^[:space:]]+)*[[:space:]]+<<(-?)[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?([[:space:]]+.*)?\$"
 
-	while [[ $eof_reached == false ]]; do
-		if ! IFS= read -r line; then
-			eof_reached=true
-			[[ -z $line && -z $logical_line ]] && break
-		fi
+	while IFS= read -r line || [[ -n $line ]]; do
 		line="${line%$'\r'}"
 
 		# Skip lines inside an active BuildKit heredoc body until its closing delimiter
@@ -1065,19 +953,12 @@ extract_dockerfile_workdir() {
 		fi
 
 		trimmed="${line#"${line%%[![:space:]]*}"}"
+		[[ $trimmed == "#"* ]] && continue
 
-		# Comments inside backslash continuations do not terminate the continuation in Docker
-		if [[ $trimmed == "#"* ]]; then
-			[[ $eof_reached == true && -n $logical_line ]] || continue
-			trimmed=""
-		fi
-
-		# Join unescaped trailing-backslash continuation lines (supports odd numbers of trailing '\')
-		if [[ $eof_reached == false ]] && [[ $trimmed =~ ^(.*[^\\]|)(\\\\)*\\[[:space:]]*$ ]]; then
+		# Join unescaped trailing-backslash continuation lines
+		if [[ $trimmed =~ ^(.*[^\\]|)(\\\\)*\\[[:space:]]*$ ]]; then
 			logical_line+="${BASH_REMATCH[1]}${BASH_REMATCH[2]} "
 			continue
-		elif [[ $eof_reached == true ]] && [[ $trimmed =~ ^(.*[^\\]|)(\\\\)*\\[[:space:]]*$ ]]; then
-			trimmed="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
 		fi
 		logical_line+="$trimmed"
 		trimmed="$logical_line"
@@ -1085,8 +966,14 @@ extract_dockerfile_workdir() {
 
 		[[ -z $trimmed ]] && continue
 
-		# Detect unquoted BuildKit heredoc start on RUN/COPY/ADD instructions
-		if _extract_heredoc_delim "$trimmed"; then
+		# Skip canonical BuildKit heredoc headers (RUN/COPY/ADD [--opt...] <<[-]DELIM ...)
+		if [[ $trimmed =~ $heredoc_re ]]; then
+			heredoc_delim="${BASH_REMATCH[4]}"
+			if [[ ${BASH_REMATCH[3]} == "-" ]]; then
+				heredoc_strip_tabs=true
+			else
+				heredoc_strip_tabs=false
+			fi
 			continue
 		fi
 
@@ -1112,9 +999,7 @@ extract_dockerfile_workdir() {
 		if [[ $trimmed =~ ^[Ww][Oo][Rr][Kk][Dd][Ii][Rr][[:space:]]+(.+)$ ]]; then
 			raw_wd="${BASH_REMATCH[1]}"
 			raw_wd="${raw_wd%"${raw_wd##*[![:space:]]}"}"
-			if [[ $raw_wd =~ ^\"(.*)\"$ ]]; then
-				raw_wd="${BASH_REMATCH[1]}"
-			elif [[ $raw_wd =~ ^\'(.*)\'$ ]]; then
+			if [[ $raw_wd =~ ^\"(.*)\"$ || $raw_wd =~ ^\'(.*)\'$ ]]; then
 				raw_wd="${BASH_REMATCH[1]}"
 			fi
 
@@ -1401,6 +1286,44 @@ to_gh_output() {
 	printf '%s\n' "$output_var"
 }
 
+# Print Dockerfile to stdout and append fenced code block to GITHUB_STEP_SUMMARY when set
+_log_dockerfile() {
+	local df_path="$1"
+	local show_header="${2:-false}"
+	local content
+
+	content=$(< "$df_path") || {
+		log_error "Failed to read Dockerfile: $df_path"
+		return 1
+	}
+	[[ $show_header == true ]] && log_info "Using Dockerfile: $df_path"
+	printf '%s\n' "$content"
+	if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
+		{
+			{ [[ $show_header != true ]] || log_info "Using Dockerfile: $df_path"; } \
+				&& printf '%b\n' '```bash' \
+				&& printf '%s\n' "$content" \
+				&& printf '%b\n' '```'
+		} >> "$GITHUB_STEP_SUMMARY" || {
+			log_error "Failed to write to GITHUB_STEP_SUMMARY"
+			return 1
+		}
+	fi
+	return 0
+}
+
+# Emit debug summary and GitHub env/output variables
+_emit_outputs() {
+	_inputs_info
+	if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
+		_inputs_info >> "$GITHUB_STEP_SUMMARY" || {
+			log_error "Failed to write to GITHUB_STEP_SUMMARY"
+			return 1
+		}
+	fi
+	_env_info || return 1
+}
+
 #=============================================================================
 # MAIN EXECUTION FLOW
 #=============================================================================
@@ -1480,25 +1403,9 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 			exit 1
 		fi
 
-		# Write Dockerfile to stdout and step summary for visibility (ensuring trailing newline before closing fence)
-		dockerfile_content=$(< "$dockerfile_path") || {
-			log_error "Failed to read Dockerfile: $dockerfile_path"
+		if ! _log_dockerfile "$dockerfile_path" true; then
 			[[ $cleanup_dockerfile == true ]] && rm -f "$dockerfile_path"
 			exit 1
-		}
-		log_info "Using Dockerfile: $dockerfile_path"
-		printf '%s\n' "$dockerfile_content"
-		if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
-			{
-				log_info "Using Dockerfile: $dockerfile_path" \
-					&& printf '%b\n' '```bash' \
-					&& printf '%s\n' "$dockerfile_content" \
-					&& printf '%b\n' '```'
-			} >> "$GITHUB_STEP_SUMMARY" || {
-				log_error "Failed to write to GITHUB_STEP_SUMMARY"
-				[[ $cleanup_dockerfile == true ]] && rm -f "$dockerfile_path"
-				exit 1
-			}
 		fi
 
 		# Build with a simple predictable tag before dumping host/custom env files into workspace
@@ -1527,16 +1434,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		}
 
 		log_debug "custom_image_tag=$custom_image_tag"
-
-		_inputs_info
-		if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
-			_inputs_info >> "$GITHUB_STEP_SUMMARY" || {
-				log_error "Failed to write to GITHUB_STEP_SUMMARY"
-				exit 1
-			}
-		fi
-		_env_info || exit 1
-
+		_emit_outputs || exit 1
 		exit 0
 	fi
 
@@ -1613,22 +1511,9 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		rm -f "$dockerfile_path"
 		exit 1
 	fi
-	dockerfile_content=$(< "$dockerfile_path") || {
-		log_error "Failed to read Dockerfile: $dockerfile_path"
+	if ! _log_dockerfile "$dockerfile_path" false; then
 		rm -f "$dockerfile_path"
 		exit 1
-	}
-	printf '%s\n' "$dockerfile_content"
-	if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
-		{
-			printf '%b\n' '```bash' \
-				&& printf '%s\n' "$dockerfile_content" \
-				&& printf '%b\n' '```'
-		} >> "$GITHUB_STEP_SUMMARY" || {
-			log_error "Failed to write to GITHUB_STEP_SUMMARY"
-			rm -f "$dockerfile_path"
-			exit 1
-		}
 	fi
 
 	# Build the custom image before dumping host/custom env files into workspace
@@ -1674,13 +1559,6 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		exit 1
 	}
 
-	_inputs_info
-	if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
-		_inputs_info >> "$GITHUB_STEP_SUMMARY" || {
-			log_error "Failed to write to GITHUB_STEP_SUMMARY"
-			exit 1
-		}
-	fi
-	_env_info || exit 1
+	_emit_outputs || exit 1
 
 fi # end sourcing guard

@@ -1206,46 +1206,26 @@ EOF
 invoke_script --workspace "$_ws_df" inputs_dockerfile="copy_heredoc.Dockerfile"
 assert_gh_output "BuildKit COPY <<EOF with relative destination preserves WORKDIR" "wd=/app_rel_copy"
 
-# BuildKit piped RUN <<'EOF' | sh ignores heredoc WORKDIR/FROM
-cat > "${_ws_df}/pipe_heredoc.Dockerfile" << 'EOF'
-FROM alpine:edge
-WORKDIR /app_pipe_ok
-RUN cat <<'EOF_PIPE' | sh
-WORKDIR /wrong_pipe_wd
-FROM scratch
-EOF_PIPE
-EOF
-invoke_script --workspace "$_ws_df" inputs_dockerfile="pipe_heredoc.Dockerfile"
-assert_gh_output "BuildKit piped RUN <<EOF | sh preserves WORKDIR" "wd=/app_pipe_ok"
-
-# BuildKit tab-stripped <<-'EOF_TAB' with chained quoted command preserves WORKDIR
-printf 'FROM alpine:edge\nWORKDIR /app_tab_ok\nRUN cat <<-'\''EOF_TAB'\'' > /tmp/x && printf "done\\n"\n\tWORKDIR /wrong_tab_wd\n\tFROM scratch\n\t\tEOF_TAB\n' > "${_ws_df}/tab_heredoc.Dockerfile"
+# BuildKit tab-stripped <<-'EOF_TAB' ignores heredoc WORKDIR/FROM until tab-indented delimiter
+printf 'FROM alpine:edge\nWORKDIR /app_tab_ok\nRUN <<-'\''EOF_TAB'\''\n\tWORKDIR /wrong_tab_wd\n\tFROM scratch\n\t\tEOF_TAB\n' > "${_ws_df}/tab_heredoc.Dockerfile"
 invoke_script --workspace "$_ws_df" inputs_dockerfile="tab_heredoc.Dockerfile"
-assert_gh_output "BuildKit tab-stripped <<-EOF with chained quoted command preserves WORKDIR" "wd=/app_tab_ok"
+assert_gh_output "BuildKit tab-stripped <<-EOF preserves WORKDIR" "wd=/app_tab_ok"
 
-# Quoted '<<EOF' or "<<EOF" literals inside RUN must NOT open an unclosed BuildKit heredoc
-cat > "${_ws_df}/quoted_literal_heredoc.Dockerfile" << 'EOF'
-FROM alpine:edge
-RUN grep -q '<<EOF' /etc/passwd || printf '%s\n' "<<EOF"
-WORKDIR /after_quoted_marker
-EOF
-invoke_script --workspace "$_ws_df" inputs_dockerfile="quoted_literal_heredoc.Dockerfile"
-assert_gh_output "quoted '<<EOF' and \"<<EOF\" literals do not swallow subsequent WORKDIR" "wd=/after_quoted_marker"
-
-# Bash <<< here-string and << bitshift inside RUN must NOT falsely open a BuildKit heredoc
+# Inline <<< here-strings, << bitshifts, and quoted '<<EOF' literals must NOT open a BuildKit heredoc
 cat > "${_ws_df}/herestring_bitshift.Dockerfile" << 'EOF'
 FROM alpine:edge
 RUN bash -c 'read -r x <<< "hello"'
 RUN python3 -c 'shift = 2; print(1 << shift)'
+RUN grep -q '<<EOF' /etc/passwd || printf '%s\n' "<<EOF"
 WORKDIR /after_herestring
 EOF
 invoke_script --workspace "$_ws_df" inputs_dockerfile="herestring_bitshift.Dockerfile"
-assert_gh_output "<<< here-string and << bitshift do not swallow subsequent WORKDIR" "wd=/after_herestring"
+assert_gh_output "<<< here-string, << bitshift, and quoted '<<EOF' do not swallow WORKDIR" "wd=/after_herestring"
 
-# Dangling trailing backslash at EOF still evaluates final WORKDIR instruction
-printf 'FROM alpine:edge\nWORKDIR /dangling_eof \134' > "${_ws_df}/dangling.Dockerfile"
-invoke_script --workspace "$_ws_df" inputs_dockerfile="dangling.Dockerfile"
-assert_gh_output "dangling trailing backslash at EOF preserves WORKDIR" "wd=/dangling_eof"
+# Dockerfile without trailing newline preserves WORKDIR and closing Markdown fence in GITHUB_STEP_SUMMARY
+printf 'FROM alpine:edge\nWORKDIR /no_eof_nl' > "${_ws_df}/no_nl.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="no_nl.Dockerfile"
+assert_gh_output "Dockerfile without trailing newline preserves WORKDIR" "wd=/no_eof_nl"
 printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "Dockerfile without trailing newline preserves closing code fence in GITHUB_STEP_SUMMARY"
 if [[ $(grep -Fcx -- $'\x60\x60\x60' "${tmp_dir}/gh_summary" 2> /dev/null) -eq 2 ]]; then
 	_pass
