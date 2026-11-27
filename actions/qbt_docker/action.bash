@@ -181,10 +181,10 @@ validate_input() {
 			fi
 			;;
 		"docker_volume")
-			# Validate volume mount format; block traversal, option injection, whitespace, and Docker socket mounts
+			# Validate volume mount format; block rootfs mount, relative container dest, traversal, whitespace, and Docker socket
 			if [[ ! $input =~ ^[a-zA-Z0-9._/,:+-]+$ ]] \
-				|| [[ ! $input =~ ^[^:]+(:[^:]+(:[a-zA-Z0-9,._-]+)?)?$ ]] \
-				|| [[ $input =~ ^-|(^|/|:)\.\.(/|:|$)|(^|/|:)docker\.sock(/|:|$) ]] \
+				|| [[ ! $input =~ ^([^:]+:/[^:]+(:[a-zA-Z0-9,._-]+)?|/[^:]+)$ ]] \
+				|| [[ $input =~ ^-|:/$|^/+:|(^|/|:)\.\.(/|:|$)|(^|/|:)docker\.sock(/|:|$) ]] \
 				|| [[ ${#input} -gt 512 ]]; then
 				log_error "Security: Invalid docker volume specification blocked: $input"
 				exit 1
@@ -273,6 +273,8 @@ validate_workspace_file() {
 
 # Validate Docker commands against whitelist
 validate_docker_commands() {
+	local LC_ALL=C
+	local IFS=$' \t\n'
 	local cmd_line
 	local -a tokens
 
@@ -288,6 +290,35 @@ validate_docker_commands() {
 			fi
 		fi
 	done
+}
+
+# Validate a GitHub Actions file-command path (reject symlinks, directories, and missing parent dirs)
+validate_gh_file_target() {
+	local file_path="$1"
+	local label="$2"
+	local parent_dir
+
+	[[ -z $file_path ]] && return 0
+
+	if [[ -L $file_path ]]; then
+		log_error "Security: ${label} must not be a symbolic link"
+		return 1
+	fi
+	if [[ -d $file_path ]]; then
+		log_error "Security: ${label} must not be a directory: $file_path"
+		return 1
+	fi
+	if [[ $file_path == */* ]]; then
+		parent_dir="${file_path%/*}"
+		[[ -z $parent_dir ]] && parent_dir="/"
+	else
+		parent_dir="."
+	fi
+	if [[ ! -d $parent_dir ]]; then
+		log_error "Failed to access parent directory for ${label}: $parent_dir"
+		return 1
+	fi
+	return 0
 }
 
 # Validate basic inputs
@@ -310,19 +341,10 @@ validate_basic_inputs() {
 		exit 1
 	fi
 
-	# Reject symbolic links on GitHub Actions runner file targets
-	if [[ -n ${GITHUB_ENV:-} && -L $GITHUB_ENV ]]; then
-		log_error "Security: GITHUB_ENV must not be a symbolic link"
-		exit 1
-	fi
-	if [[ -n ${GITHUB_OUTPUT:-} && -L $GITHUB_OUTPUT ]]; then
-		log_error "Security: GITHUB_OUTPUT must not be a symbolic link"
-		exit 1
-	fi
-	if [[ -n ${GITHUB_STEP_SUMMARY:-} && -L $GITHUB_STEP_SUMMARY ]]; then
-		log_error "Security: GITHUB_STEP_SUMMARY must not be a symbolic link"
-		exit 1
-	fi
+	# Validate GitHub Actions runner file targets upfront before building or starting containers
+	validate_gh_file_target "${GITHUB_ENV:-}" "GITHUB_ENV" || exit 1
+	validate_gh_file_target "${GITHUB_OUTPUT:-}" "GITHUB_OUTPUT" || exit 1
+	validate_gh_file_target "${GITHUB_STEP_SUMMARY:-}" "GITHUB_STEP_SUMMARY" || exit 1
 
 	# Validate os_id format (OCI image name: starts/ends alphanumeric, no '//' or '..' segments)
 	if [[ ! $inputs_os_id =~ ^[a-zA-Z0-9]([a-zA-Z0-9._/-]*[a-zA-Z0-9])?$ ]] \
@@ -758,6 +780,7 @@ process_environment() {
 # Parse and validate additional docker apps
 # Handle both YAML multiline (>) folded strings (space-separated) and literal (|) strings (newline-separated)
 parse_app_list() {
+	local IFS=$' \t\n'
 	local input="$1"
 	local -n result_array=$2
 
@@ -787,6 +810,7 @@ parse_app_list() {
 
 # Parse and validate docker commands
 parse_docker_commands() {
+	local LC_ALL=C
 	local pkg
 	local e
 	local e_trim
@@ -877,17 +901,32 @@ extract_dockerfile_workdir() {
 	local df_file="$1"
 	local line
 	local trimmed
+	local logical_line=""
+	local heredoc_delim=""
+	local heredoc_strip_tabs=false
+	local check_line
 	local raw_wd
 	local base_ref
 	local stage_wd=""
 	local stage_invalid=false
 	local current_stage=""
-	local in_continuation=false
 	local -A stage_wds=()
 	local -A stage_invalids=()
 
 	while IFS= read -r line || [[ -n $line ]]; do
 		line="${line%$'\r'}"
+
+		# Skip lines inside an active BuildKit heredoc body until its closing delimiter
+		if [[ -n $heredoc_delim ]]; then
+			check_line="$line"
+			[[ $heredoc_strip_tabs == true ]] && check_line="${check_line#"${check_line%%[!$'\t']*}"}"
+			if [[ $check_line == "$heredoc_delim" ]]; then
+				heredoc_delim=""
+				heredoc_strip_tabs=false
+			fi
+			continue
+		fi
+
 		trimmed="${line#"${line%%[![:space:]]*}"}"
 
 		# Comments inside backslash continuations do not terminate the continuation in Docker
@@ -895,23 +934,41 @@ extract_dockerfile_workdir() {
 			continue
 		fi
 
-		if [[ $in_continuation == true ]]; then
-			if [[ ! $trimmed =~ \\[[:space:]]*$ ]]; then
-				in_continuation=false
-			fi
+		# Join unescaped trailing-backslash continuation lines
+		if [[ ! $trimmed =~ \\\\[[:space:]]*$ ]] && [[ $trimmed =~ ^(.*)\\[[:space:]]*$ ]]; then
+			logical_line+="${BASH_REMATCH[1]} "
 			continue
 		fi
+		logical_line+="$trimmed"
+		trimmed="$logical_line"
+		logical_line=""
 
-		if [[ $trimmed =~ \\[[:space:]]*$ ]]; then
-			in_continuation=true
+		[[ -z $trimmed ]] && continue
+
+		# Detect BuildKit heredoc start on non-FROM/WORKDIR instructions (e.g., RUN <<EOF, COPY <<-EOF)
+		if [[ ! $trimmed =~ ^([Ff][Rr][Oo][Mm]|[Ww][Oo][Rr][Kk][Dd][Ii][Rr])[[:space:]] ]] \
+			&& [[ $trimmed =~ ^[A-Za-z]+[[:space:]].*\<\<(-?)[[:space:]]*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)[\'\"]? ]]; then
+			heredoc_delim="${BASH_REMATCH[2]}"
+			if [[ ${BASH_REMATCH[1]} == "-" ]]; then
+				heredoc_strip_tabs=true
+			else
+				heredoc_strip_tabs=false
+			fi
+			continue
 		fi
 
 		# Match valid Dockerfile FROM instructions: FROM [--opt=val ...] <image> [AS <name>] [# comment]
 		if [[ $trimmed =~ ^[Ff][Rr][Oo][Mm][[:space:]]+(--[a-zA-Z0-9_-]+=[^[:space:]]+[[:space:]]+)*([^[:space:]#]+)([[:space:]]+[Aa][Ss][[:space:]]+([a-zA-Z0-9._-]+))?([[:space:]]*(#.*)?)?$ ]]; then
 			base_ref="${BASH_REMATCH[2],,}"
 			current_stage="${BASH_REMATCH[4],,}"
-			stage_wd="${stage_wds[$base_ref]:-}"
-			stage_invalid="${stage_invalids[$base_ref]:-false}"
+			# Only look up stage_wds when base_ref is a valid stage alias (prevents array subscript injection)
+			if [[ $base_ref =~ ^[a-z0-9._-]+$ ]]; then
+				stage_wd="${stage_wds["$base_ref"]:-}"
+				stage_invalid="${stage_invalids["$base_ref"]:-false}"
+			else
+				stage_wd=""
+				stage_invalid=false
+			fi
 			if [[ -n $current_stage ]]; then
 				stage_wds["$current_stage"]="$stage_wd"
 				stage_invalids["$current_stage"]="$stage_invalid"
@@ -1052,7 +1109,7 @@ generate_standard_dockerfile() {
 				"RUN apt-get update && apt-get upgrade -y && ${backslash}"
 				"    apt-get install -y sudo${inputs_additional_apps_array[*]:+ ${inputs_additional_apps_array[*]}} && ${backslash}"
 				"    groupadd -g ${non_root_gid} ${non_root_user} && ${backslash}"
-				"    useradd -ms /bin/bash -u ${non_root_uid} -g ${non_root_gid} ${non_root_user} && ${backslash}"
+				"    useradd -d ${wd} -ms /bin/bash -u ${non_root_uid} -g ${non_root_gid} ${non_root_user} && ${backslash}"
 				"    umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && ${backslash}"
 				"    chmod 0440 /etc/sudoers.d/${non_root_user} && ${backslash}"
 				"    apt-get clean"
@@ -1074,7 +1131,7 @@ generate_standard_dockerfile() {
 				"    apk update >/dev/null 2>&1 && apk upgrade >/dev/null 2>&1 && apk add --no-cache sudo bash${inputs_additional_apps_array[*]:+ ${inputs_additional_apps_array[*]}} >/dev/null 2>&1; ${backslash}"
 				"  fi && ${backslash}"
 				"    { groupadd -g ${non_root_gid} ${non_root_user} 2>/dev/null || addgroup -g ${non_root_gid} ${non_root_user} 2>/dev/null || true; } && ${backslash}"
-				"    { useradd -ms /bin/bash -u ${non_root_uid} -g ${non_root_gid} ${non_root_user} 2>/dev/null || adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} -G ${non_root_user} ${non_root_user} 2>/dev/null || true; } && ${backslash}"
+				"    { useradd -d ${wd} -ms /bin/bash -u ${non_root_uid} -g ${non_root_gid} ${non_root_user} 2>/dev/null || adduser -h ${wd} -D -s /bin/bash -u ${non_root_uid} -G ${non_root_user} ${non_root_user} 2>/dev/null || true; } && ${backslash}"
 				"    if command -v sudo >/dev/null 2>&1; then mkdir -p /etc/sudoers.d && umask 077 && printf '%s\\n' \"${non_root_user} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/${non_root_user} && chmod 0440 /etc/sudoers.d/${non_root_user}; fi"
 			)
 			;;
@@ -1183,10 +1240,7 @@ to_gh_env() {
 		return 1
 	fi
 	if [[ -n ${GITHUB_ENV:-} ]]; then
-		if [[ -L $GITHUB_ENV ]]; then
-			log_error "Security: GITHUB_ENV must not be a symbolic link"
-			return 1
-		fi
+		validate_gh_file_target "$GITHUB_ENV" "GITHUB_ENV" || return 1
 		printf '%s\n' "$env_var" >> "$GITHUB_ENV" || return 1
 	fi
 	printf '%s\n' "$env_var"
@@ -1200,10 +1254,7 @@ to_gh_output() {
 		return 1
 	fi
 	if [[ -n ${GITHUB_OUTPUT:-} ]]; then
-		if [[ -L $GITHUB_OUTPUT ]]; then
-			log_error "Security: GITHUB_OUTPUT must not be a symbolic link"
-			return 1
-		fi
+		validate_gh_file_target "$GITHUB_OUTPUT" "GITHUB_OUTPUT" || return 1
 		printf '%s\n' "$output_var" >> "$GITHUB_OUTPUT" || return 1
 	fi
 	printf '%s\n' "$output_var"
@@ -1285,17 +1336,20 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 			fi
 		fi
 
-		# Write Dockerfile to the step summary for visibility
+		# Write Dockerfile to stdout and step summary for visibility
+		log_info "Using Dockerfile: $dockerfile_path"
+		cat "$dockerfile_path"
 		if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
-			log_info "Using Dockerfile: $dockerfile_path" | tee -a "$GITHUB_STEP_SUMMARY"
 			{
+				log_info "Using Dockerfile: $dockerfile_path"
 				printf '%b\n' '```bash'
 				cat "$dockerfile_path"
 				printf '%b\n' '```'
-			} | tee -a "$GITHUB_STEP_SUMMARY"
-		else
-			log_info "Using Dockerfile: $dockerfile_path"
-			cat "$dockerfile_path"
+			} >> "$GITHUB_STEP_SUMMARY" || {
+				log_error "Failed to write to GITHUB_STEP_SUMMARY"
+				[[ $cleanup_dockerfile == true ]] && rm -f "$dockerfile_path"
+				exit 1
+			}
 		fi
 
 		# Build with a simple predictable tag before dumping host/custom env files into workspace
@@ -1319,16 +1373,18 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		# Start a container (detached) from the built image so it's running like a daemon.
 		log_info "Starting container from image '$custom_image_tag' as ${container_name} (detached)"
 		docker run -it -d --platform "$inputs_platform" --name "${container_name}" "${clean_envs[@]}" "${docker_command[@]}" || {
-			log_error "Failed to start container from image $custom_image_tag"
+			log_error "Failed to start container from image $custom_image_tag with command: $(format_clean_envs_for_log) ${docker_command[*]}"
 			exit 1
 		}
 
 		log_debug "custom_image_tag=$custom_image_tag"
 
+		_inputs_info
 		if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
-			_inputs_info | tee -a "$GITHUB_STEP_SUMMARY"
-		else
-			_inputs_info
+			_inputs_info >> "$GITHUB_STEP_SUMMARY" || {
+				log_error "Failed to write to GITHUB_STEP_SUMMARY"
+				exit 1
+			}
 		fi
 		_env_info || exit 1
 
@@ -1406,7 +1462,11 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 			printf '%b\n' '```bash'
 			cat "$dockerfile_path"
 			printf '%b\n' '```'
-		} >> "$GITHUB_STEP_SUMMARY"
+		} >> "$GITHUB_STEP_SUMMARY" || {
+			log_error "Failed to write to GITHUB_STEP_SUMMARY"
+			rm -f "$dockerfile_path"
+			exit 1
+		}
 	fi
 
 	# Build the custom image before dumping host/custom env files into workspace
@@ -1452,10 +1512,12 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		exit 1
 	}
 
+	_inputs_info
 	if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
-		_inputs_info | tee -a "$GITHUB_STEP_SUMMARY"
-	else
-		_inputs_info
+		_inputs_info >> "$GITHUB_STEP_SUMMARY" || {
+			log_error "Failed to write to GITHUB_STEP_SUMMARY"
+			exit 1
+		}
 	fi
 	_env_info || exit 1
 

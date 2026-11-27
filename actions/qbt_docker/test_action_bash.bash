@@ -288,6 +288,20 @@ else
 	_fail "symlink target was modified" "$(cat "${tmp_dir}/sym_gh_target" 2> /dev/null)"
 fi
 
+# Directory or missing-parent GITHUB_ENV fails upfront before docker build/run
+mkdir -p "${tmp_dir}/dir_gh_env"
+run_test "directory GITHUB_ENV exits 1 before docker runs" 1 \
+	GITHUB_ENV="${tmp_dir}/dir_gh_env"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "directory GITHUB_ENV prevented docker build/run"
+if [[ ! -s "${tmp_dir}/docker_calls.log" ]]; then
+	_pass
+else
+	_fail "docker was invoked despite invalid GITHUB_ENV" "$(docker_log)"
+fi
+
+run_test "missing parent dir for GITHUB_OUTPUT exits 1" 1 \
+	GITHUB_OUTPUT="${tmp_dir}/no_such_dir/gh_out"
+
 #─────────────────────────────────────────────────────
 section "Platform Validation"
 #─────────────────────────────────────────────────────
@@ -774,6 +788,12 @@ else
 	_fail "stale env.load was not removed or was passed to docker" "$(docker_log)"
 fi
 
+# Directory collision at env.load fails upfront before docker build
+_ws_dir_envload="${tmp_dir}/ws_dir_envload"
+mkdir -p "${_ws_dir_envload}/env.load"
+run_test "directory collision at env.load exits 1" 1 \
+	--workspace "$_ws_dir_envload"
+
 #─────────────────────────────────────────────────────
 section "Custom Docker Commands"
 #─────────────────────────────────────────────────────
@@ -846,6 +866,12 @@ run_test "docker.sock mount in --volume exits 1" 1 \
 
 run_test "docker.sock/ trailing-slash mount in --volume exits 1" 1 \
 	inputs_custom_docker_commands="--volume /var/run/docker.sock/:/tmp/sock"
+
+run_test "host root filesystem mount (/:/host) in --volume exits 1" 1 \
+	inputs_custom_docker_commands="--volume /:/host"
+
+run_test "relative container mount destination in --volume exits 1" 1 \
+	inputs_custom_docker_commands="--volume /tmp:relative_dest"
 
 # Secret value in --env reaches docker run while redacted in step summary and error logs
 invoke_script inputs_custom_docker_commands="--env MY_API_SECRET=ultra_secret_token_777"
@@ -986,7 +1012,51 @@ printf 'FROM alpine:edge\nWORKDIR /workspace\nRUN echo ok \\\n  # comment inside
 invoke_script --workspace "$_ws_df" inputs_dockerfile="multiline_run.Dockerfile"
 assert_gh_output "multiline RUN with 'from ...' does not clobber WORKDIR" "wd=/workspace"
 
+# Multiline FROM --platform=\ continuation and BuildKit <<EOF heredoc ignore heredoc WORKDIR/FROM
+cat > "${_ws_df}/heredoc.Dockerfile" << 'EOF'
+FROM --platform=linux/amd64 \
+	alpine:edge AS stage1
+WORKDIR /stage1_ignored
+FROM --platform=linux/amd64 \
+	alpine:edge
+WORKDIR /heredoc_safe
+RUN <<HEREDOC
+WORKDIR /should_be_ignored
+FROM scratch
+HEREDOC
+EOF
+invoke_script --workspace "$_ws_df" inputs_dockerfile="heredoc.Dockerfile"
+assert_gh_output "multiline FROM and BuildKit <<HEREDOC preserve real WORKDIR" "wd=/heredoc_safe"
+
+# Adversarial FROM token with brackets/command-like syntax cannot trigger array subscript errors or command execution
+# shellcheck disable=SC2016
+printf 'FROM bad[$(touch %s/pwned)]\nWORKDIR /safe_sub\n' "${tmp_dir}" > "${_ws_df}/badsub.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="badsub.Dockerfile"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "FROM with bracket/command syntax does not execute or fail array subscript"
+if [[ ! -e "${tmp_dir}/pwned" ]] \
+	&& ! grep -qi "bad array subscript" "${tmp_dir}/last_output" \
+	&& grep -qF "wd=/safe_sub" "${tmp_dir}/gh_output"; then
+	_pass
+else
+	_fail "bracketed FROM caused subscript error or command execution" "$(last_output)"
+fi
+
+# Fast-path when inputs_dockerfile is named qbt_builder_dockerfile (-ef self-preservation)
+_ws_self_df="${tmp_dir}/ws_self_df"
+mkdir -p "$_ws_self_df"
+printf 'FROM alpine:edge\nWORKDIR /self_ok\n' > "${_ws_self_df}/qbt_builder_dockerfile"
+run_test "inputs_dockerfile=qbt_builder_dockerfile succeeds" 0 \
+	--workspace "$_ws_self_df" \
+	inputs_dockerfile="qbt_builder_dockerfile"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "source qbt_builder_dockerfile preserved when used directly as input"
+if [[ -s "${_ws_self_df}/qbt_builder_dockerfile" ]]; then
+	_pass
+else
+	_fail "user-supplied qbt_builder_dockerfile was deleted" ""
+fi
+
 # docker build uses $workspace as build context in both fast-path and standard path
+invoke_script --workspace "$_ws_df" inputs_dockerfile="my.Dockerfile"
 assert_docker "fast-path docker build uses workspace as build context" "-t custom_dockerfile ${_ws_df}"
 invoke_script --workspace "$_ws_df"
 assert_docker "standard docker build uses workspace as build context" "-t qbt_builder ${_ws_df}"
@@ -1005,16 +1075,20 @@ else
 	_fail "temporary Dockerfile or env.host left behind after build failure" ""
 fi
 
-# Fast-path docker build failure exits 1 and cleans up temporary Dockerfile
+# Fast-path docker build failure exits 1, cleans up temporary Dockerfile, and skips env.host dump
+_ws_fp_fail="${tmp_dir}/ws_fp_fail"
+mkdir -p "$_ws_fp_fail"
+printf 'FROM alpine:edge\nWORKDIR /build\n' > "${_ws_fp_fail}/my.Dockerfile"
 run_test "fast-path docker build failure exits 1" 1 \
-	--workspace "$_ws_df" \
+	--workspace "$_ws_fp_fail" \
 	inputs_dockerfile="my.Dockerfile" \
+	inputs_use_host_env="true" \
 	MOCK_DOCKER_FAIL="build"
-printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "fast-path docker build failure cleans up temp Dockerfile"
-if [[ ! -f "${_ws_df}/qbt_builder_dockerfile" ]]; then
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "fast-path docker build failure cleans up temp Dockerfile and skips env.host dump"
+if [[ ! -f "${_ws_fp_fail}/qbt_builder_dockerfile" && ! -e "${_ws_fp_fail}/env.host" && ! -e "${_ws_fp_fail}/env.load" ]]; then
 	_pass
 else
-	_fail "temporary Dockerfile left behind after fast-path build failure" ""
+	_fail "temporary Dockerfile or env.host left behind after fast-path build failure" ""
 fi
 
 # Standard path docker run failure exits 1
@@ -1115,18 +1189,27 @@ else
 	_fail "missing docker binary did not exit 1 with expected message" "$(cat "${tmp_dir}/nodocker.out" 2> /dev/null)"
 fi
 
-printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "Sourcing and calling validation functions preserves caller LC_ALL"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "Sourcing and calling validation functions preserves caller LC_ALL and works under custom IFS"
 if (
 	# shellcheck source=/dev/null
 	source "$script_path" 2> /dev/null
 	LC_ALL="$_utf8_loc"
+	IFS=":"
 	check_env_var "GOOD_VAR=1"
 	validate_input "linux/amd64" "platform"
-	[[ $LC_ALL == "$_utf8_loc" ]]
+	declare -a _apps=()
+	parse_app_list "curl wget" _apps
+	# shellcheck disable=SC2034
+	inputs_additional_apps="curl git"
+	# shellcheck disable=SC2034
+	inputs_custom_docker_commands="--memory 2g"
+	parse_docker_commands
+	# shellcheck disable=SC2154
+	[[ $LC_ALL == "$_utf8_loc" && $IFS == ":" && ${#_apps[@]} -eq 2 && ${#clean_envs[@]} -eq 2 ]]
 ); then
 	_pass
 else
-	_fail "validation functions mutated caller LC_ALL" ""
+	_fail "validation/parsing functions mutated caller LC_ALL/IFS or failed under custom IFS" ""
 fi
 
 #─────────────────────────────────────────────────────
