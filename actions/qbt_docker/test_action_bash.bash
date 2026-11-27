@@ -62,7 +62,9 @@ invoke_script() {
 	if [[ $custom_ws == false ]]; then
 		rm -rf "$ws_dir"
 	fi
-	mkdir -p "$ws_dir"
+	if [[ $ws_dir == /* ]]; then
+		mkdir -p "$ws_dir"
+	fi
 
 	: > "${tmp_dir}/gh_env"
 	: > "${tmp_dir}/gh_output"
@@ -114,7 +116,7 @@ assert_output() {
 	invoke_script "$@"
 	local plain
 	plain=$(last_output | sed 's/\x1b\[[0-9;]*m//g')
-	if printf '%s' "$plain" | grep -q "$pattern"; then
+	if printf '%s' "$plain" | grep -q -- "$pattern"; then
 		_pass
 	else
 		_fail "output did not contain: $pattern" "$plain"
@@ -126,7 +128,7 @@ assert_gh_output() {
 	local name="$1"
 	local pattern="$2"
 	printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "$name"
-	if grep -qF "$pattern" "${tmp_dir}/gh_output" 2> /dev/null; then
+	if grep -qF -- "$pattern" "${tmp_dir}/gh_output" 2> /dev/null; then
 		_pass
 	else
 		_fail "GITHUB_OUTPUT did not contain: $pattern" "$(cat "${tmp_dir}/gh_output" 2> /dev/null)"
@@ -151,19 +153,21 @@ assert_dockerfile() {
 	local name="$1"
 	local pattern="$2"
 	printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "$name"
-	if grep -qE "$pattern" "${tmp_dir}/last_dockerfile" 2> /dev/null; then
+	if [[ -f "${tmp_dir}/last_dockerfile" ]] && grep -qE -- "$pattern" "${tmp_dir}/last_dockerfile" 2> /dev/null; then
 		_pass
 	else
 		_fail "Dockerfile did not contain: $pattern" "$(cat "${tmp_dir}/last_dockerfile" 2> /dev/null)"
 	fi
 }
 
-# Post-invoke: assert the saved Dockerfile does NOT contain a pattern.
+# Post-invoke: assert the saved Dockerfile exists and does NOT contain a pattern.
 assert_not_dockerfile() {
 	local name="$1"
 	local pattern="$2"
 	printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "$name"
-	if ! grep -qE "$pattern" "${tmp_dir}/last_dockerfile" 2> /dev/null; then
+	if [[ ! -f "${tmp_dir}/last_dockerfile" ]]; then
+		_fail "Dockerfile was not captured (build may not have run)" "$(last_output)"
+	elif ! grep -qE -- "$pattern" "${tmp_dir}/last_dockerfile" 2> /dev/null; then
 		_pass
 	else
 		_fail "Dockerfile should not contain: $pattern" "$(cat "${tmp_dir}/last_dockerfile" 2> /dev/null)"
@@ -244,12 +248,67 @@ run_test "inputs_os_version_id with ^ char exits 1" 1 \
 run_test "inputs_os_version_id over 64 chars exits 1" 1 \
 	inputs_os_version_id="$(printf 'v%.0s' {1..65})"
 
+run_test "inputs_os_id starting with hyphen exits 1" 1 \
+	inputs_os_id="-f"
+
+run_test "inputs_os_id with .. path segment exits 1" 1 \
+	inputs_os_id="alpine/../debian"
+
+run_test "arch-prefixed inputs_os_id with leading-hyphen image exits 1" 1 \
+	inputs_os_id="arm64v8/-alpine"
+
+run_test "inputs_os_version_id starting with hyphen exits 1" 1 \
+	inputs_os_version_id="-edge"
+
+run_test "workspace path containing colon exits 1" 1 \
+	--workspace "${tmp_dir}/ws:bad"
+
+run_test "relative workspace path exits 1" 1 \
+	--workspace "relative_ws_dir"
+
+# Symlinked GITHUB_ENV / GITHUB_OUTPUT / GITHUB_STEP_SUMMARY must be rejected without clobbering targets
+printf 'KEEP_SAFE\n' > "${tmp_dir}/sym_gh_target"
+ln -sf "${tmp_dir}/sym_gh_target" "${tmp_dir}/sym_gh_env"
+ln -sf "${tmp_dir}/sym_gh_target" "${tmp_dir}/sym_gh_out"
+ln -sf "${tmp_dir}/sym_gh_target" "${tmp_dir}/sym_gh_sum"
+
+run_test "symlinked GITHUB_ENV exits 1" 1 \
+	GITHUB_ENV="${tmp_dir}/sym_gh_env"
+
+run_test "symlinked GITHUB_OUTPUT exits 1" 1 \
+	GITHUB_OUTPUT="${tmp_dir}/sym_gh_out"
+
+run_test "symlinked GITHUB_STEP_SUMMARY exits 1" 1 \
+	GITHUB_STEP_SUMMARY="${tmp_dir}/sym_gh_sum"
+
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "symlinked GITHUB_* targets were not clobbered"
+if [[ $(cat "${tmp_dir}/sym_gh_target") == "KEEP_SAFE" ]]; then
+	_pass
+else
+	_fail "symlink target was modified" "$(cat "${tmp_dir}/sym_gh_target" 2> /dev/null)"
+fi
+
 #─────────────────────────────────────────────────────
 section "Platform Validation"
 #─────────────────────────────────────────────────────
 
 run_test "inputs_platform=LINUX/AMD64 (uppercase) exits 1" 1 \
 	inputs_platform="LINUX/AMD64"
+
+# Locale-collation check: uppercase platform and non-ASCII package name must fail even under UTF-8 locales
+_utf8_loc="C.UTF-8"
+if locale -a 2> /dev/null | grep -qi '^en_US\.utf-\?8$'; then
+	_utf8_loc=$(locale -a 2> /dev/null | grep -i '^en_US\.utf-\?8$' | head -1)
+fi
+run_test "inputs_platform=LINUX/AMD64 under UTF-8 locale exits 1" 1 \
+	LC_ALL="$_utf8_loc" \
+	LANG="$_utf8_loc" \
+	inputs_platform="LINUX/AMD64"
+
+run_test "non-ASCII package name under UTF-8 locale exits 1" 1 \
+	LC_ALL="$_utf8_loc" \
+	LANG="$_utf8_loc" \
+	inputs_additional_apps=$'c\xc3\xbcrl'
 
 run_test "inputs_platform=linux-amd64 (no slash) exits 1" 1 \
 	inputs_platform="linux-amd64"
@@ -270,8 +329,11 @@ run_test "package name with semicolon exits 1" 1 \
 run_test "package name with exclamation exits 1" 1 \
 	inputs_additional_apps="curl!bad"
 
+run_test "package name starting with hyphen (flag injection) exits 1" 1 \
+	inputs_additional_apps="--allow-untrusted"
+
 run_test "valid package list is accepted" 0 \
-	inputs_additional_apps="curl wget"
+	inputs_additional_apps="curl wget g++ libstdc++-dev python3.12"
 
 #─────────────────────────────────────────────────────
 section "Dockerfile Fast-Path"
@@ -285,6 +347,9 @@ run_test "http remote Dockerfile exits 1" 1 \
 
 run_test "https remote Dockerfile exits 1" 1 \
 	inputs_dockerfile="https://evil.example.com/Dockerfile"
+
+run_test "file:// URI Dockerfile exits 1" 1 \
+	inputs_dockerfile="file:///etc/passwd"
 
 run_test "missing Dockerfile exits 1" 1 \
 	inputs_dockerfile="does_not_exist.txt"
@@ -306,6 +371,40 @@ mkdir -p "$_ws_empty"
 run_test "empty Dockerfile exits 1" 1 \
 	--workspace "$_ws_empty" \
 	inputs_dockerfile="empty.Dockerfile"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "empty Dockerfile cleans up temp Dockerfile"
+if [[ ! -f "${_ws_empty}/qbt_builder_dockerfile" ]]; then
+	_pass
+else
+	_fail "temp Dockerfile left behind on empty Dockerfile failure" ""
+fi
+
+# Filename containing consecutive dots (not a '..' path segment) must be allowed
+printf 'FROM alpine:edge\n' > "${_ws_df}/my..Dockerfile"
+run_test "Dockerfile filename with consecutive dots is accepted" 0 \
+	--workspace "$_ws_df" \
+	inputs_dockerfile="my..Dockerfile"
+
+# Symlinked Dockerfile pointing outside workspace must be blocked without leaking target content
+printf 'TOP_SECRET_HOST_TOKEN=xyz987\n' > "${tmp_dir}/secret_target"
+ln -sf "${tmp_dir}/secret_target" "${_ws_df}/symlink.Dockerfile"
+run_test "symlinked inputs_dockerfile exits 1" 1 \
+	--workspace "$_ws_df" \
+	inputs_dockerfile="symlink.Dockerfile"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "symlinked Dockerfile does not leak target content"
+if ! grep -qF "TOP_SECRET_HOST_TOKEN" "${tmp_dir}/last_output" 2> /dev/null \
+	&& ! grep -qF "TOP_SECRET_HOST_TOKEN" "${tmp_dir}/gh_summary" 2> /dev/null; then
+	_pass
+else
+	_fail "symlink target content leaked to output or step summary" "$(last_output)"
+fi
+
+# Symlinked parent directory inside workspace must be blocked
+mkdir -p "${tmp_dir}/outside_dir"
+printf 'FROM alpine:edge\n' > "${tmp_dir}/outside_dir/Dockerfile"
+ln -sfn "${tmp_dir}/outside_dir" "${_ws_df}/sym_sub"
+run_test "inputs_dockerfile inside symlinked subdirectory exits 1" 1 \
+	--workspace "$_ws_df" \
+	inputs_dockerfile="sym_sub/Dockerfile"
 
 #─────────────────────────────────────────────────────
 section "Platform Auto-Detection from RUNNER_ARCH"
@@ -349,6 +448,9 @@ assert_docker "s390x/alpine -> linux/s390x" "linux/s390x"
 
 invoke_script inputs_os_id="riscv64/alpine"
 assert_docker "riscv64/alpine -> linux/riscv64" "linux/riscv64"
+
+invoke_script inputs_os_id="i386/alpine"
+assert_docker "i386/alpine -> linux/i386" "linux/i386"
 
 #─────────────────────────────────────────────────────
 section "GitHub Outputs"
@@ -400,32 +502,48 @@ assert_not_dockerfile "userdocs image -> no user creation" "adduser|useradd"
 
 invoke_script inputs_os_id="fedora" inputs_os_version_id="40"
 assert_dockerfile "unknown OS -> fallback Dockerfile generated" "if command -v apt-get"
+assert_dockerfile "unknown OS -> groups user/group fallback commands safely" "\{ groupadd -g 1001 gh"
+assert_dockerfile "unknown OS -> apk fallback installs sudo and bash" "apk add --no-cache sudo bash"
+
+# Org-prefixed images (e.g., alpine/git, ubuntu/squid) must not lose their OS namespace in fallback
+invoke_script inputs_os_id="alpine/git" inputs_os_version_id="latest"
+assert_dockerfile "alpine/git org image -> detected as alpine (apk)" "apk add --no-cache sudo bash"
+
+invoke_script inputs_os_id="ubuntu/squid" inputs_os_version_id="latest"
+assert_dockerfile "ubuntu/squid org image -> detected as ubuntu (apt-get)" "apt-get install -y sudo"
 
 #─────────────────────────────────────────────────────
 section "OS Detection via Buildx Metadata (jq)"
 #─────────────────────────────────────────────────────
 
-# Section 1: userdocs base.id (multi-arch schema)
+# Section 1: userdocs base.id (multi-arch schema, OS-neutral image name so fallback cannot mask jq)
 invoke_script \
-	inputs_os_id="ghcr.io/userdocs/qbt-debian" \
+	inputs_os_id="ghcr.io/userdocs/qbt-nox" \
 	inputs_os_version_id="latest" \
 	inputs_additional_apps="git" \
-	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{"org.opencontainers.image.base.id":"debian"}}}}}'
-assert_dockerfile "userdocs base.id=debian (multi-arch) -> apt-get with apps" "apt-get install -y git"
+	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{"org.opencontainers.image.base.id":"Debian"}}}}}'
+assert_dockerfile "userdocs base.id=Debian (multi-arch, neutral name) -> apt-get with apps" "apt-get install -y git"
 
-# Section 1: userdocs base.name (single-arch schema)
+# Section 1: userdocs base.name (single-arch schema, OS-neutral image name)
 invoke_script \
-	inputs_os_id="ghcr.io/userdocs/qbt-ubuntu" \
+	inputs_os_id="ghcr.io/userdocs/qbt-custom" \
 	inputs_os_version_id="latest" \
 	MOCK_BUILDX_JSON='{"image":{"config":{"Labels":{"org.opencontainers.image.base.name":"ghcr.io/library/ubuntu:24.04"}}}}'
-assert_dockerfile "userdocs base.name=ubuntu (single-arch) -> apt-get" "apt-get update"
+assert_dockerfile "userdocs base.name=ubuntu (single-arch, neutral name) -> apt-get" "apt-get update"
 
-# Section 2: official image URL label
+# Section 2: official image URL label (OS-neutral image name)
 invoke_script \
-	inputs_os_id="custom/mydebian" \
+	inputs_os_id="custom/myimage" \
 	inputs_os_version_id="latest" \
 	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{"org.opencontainers.image.url":"https://hub.docker.com/_/debian"}}}}}'
-assert_dockerfile "official image.url=debian -> apt-get" "apt-get"
+assert_dockerfile "official image.url=debian (neutral name) -> apt-get" "apt-get"
+
+# Section 2: Docker Hub normalized .name (docker.io/library/debian:bookworm)
+invoke_script \
+	inputs_os_id="custom/mystery" \
+	inputs_os_version_id="latest" \
+	MOCK_BUILDX_JSON='{"name":"docker.io/library/debian:bookworm","image":{"linux/amd64":{"config":{"Labels":{}}}}}'
+assert_dockerfile "official docker.io/library/debian .name -> apt-get" "apt-get"
 
 # Section 2: official image name fallback when .name is absent from buildx JSON
 invoke_script \
@@ -440,6 +558,20 @@ invoke_script \
 	inputs_os_version_id="1.0" \
 	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{}},"history":[{"created_by":"Debian base image setup"}]}}}'
 assert_dockerfile "history with capitalized 'Debian' -> apt-get" "apt-get"
+
+# Section 3: DEBIAN_FRONTEND in history must NOT falsely classify an unknown image as debian
+invoke_script \
+	inputs_os_id="custom/mystery" \
+	inputs_os_version_id="1.0" \
+	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{}},"history":[{"created_by":"ENV DEBIAN_FRONTEND=noninteractive"}]}}}'
+assert_dockerfile "DEBIAN_FRONTEND in history does not false-match debian" "if command -v apt-get"
+
+# Multi-arch Buildx JSON with leading empty attestation entry still finds platform Labels
+invoke_script \
+	inputs_os_id="ghcr.io/userdocs/qbt-nox" \
+	inputs_os_version_id="latest" \
+	MOCK_BUILDX_JSON='{"image":{"attestation-manifest":{},"linux/amd64":{"config":{"Labels":{"org.opencontainers.image.base.id":"debian"}}}}}'
+assert_dockerfile "multi-arch Buildx JSON skips empty attestation entry -> apt-get" "apt-get update"
 
 #─────────────────────────────────────────────────────
 section "Additional Apps in Dockerfile"
@@ -474,31 +606,83 @@ assert_docker "safe env.custom var passed via --env-file" "--env-file"
 # PATH= in env.custom must be blocked
 printf 'PATH=/evil\n' > "${_ws_env}/env.custom"
 invoke_script --workspace "$_ws_env"
+_rc=$?
 printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "PATH= in env.custom is blocked"
-if ! grep -q "PATH=/evil" "${_ws_env}/env.load" 2> /dev/null; then
+if [[ $_rc -eq 0 && -f "${_ws_env}/env.load" ]] && ! grep -q "PATH=/evil" "${_ws_env}/env.load" 2> /dev/null; then
 	_pass
 else
-	_fail "env.load should not contain PATH=/evil" "$(cat "${_ws_env}/env.load" 2> /dev/null)"
+	_fail "env.load missing or contained PATH=/evil (rc=$_rc)" "$(cat "${_ws_env}/env.load" 2> /dev/null)"
 fi
 
 # LD_PRELOAD= in env.custom must be blocked
 printf 'LD_PRELOAD=evil.so\n' > "${_ws_env}/env.custom"
 invoke_script --workspace "$_ws_env"
+_rc=$?
 printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "LD_PRELOAD= in env.custom is blocked"
-if ! grep -q "LD_PRELOAD" "${_ws_env}/env.load" 2> /dev/null; then
+if [[ $_rc -eq 0 && -f "${_ws_env}/env.load" ]] && ! grep -q "LD_PRELOAD" "${_ws_env}/env.load" 2> /dev/null; then
 	_pass
 else
-	_fail "env.load should not contain LD_PRELOAD" "$(cat "${_ws_env}/env.load" 2> /dev/null)"
+	_fail "env.load missing or contained LD_PRELOAD (rc=$_rc)" "$(cat "${_ws_env}/env.load" 2> /dev/null)"
 fi
 
-# Extended blocklist: BASH_ENV, ENV, PROMPT_COMMAND, GITHUB_ENV, DYLD_INSERT_LIBRARIES must be blocked
-printf 'BASH_ENV=/evil\nENV=/evil\nPROMPT_COMMAND=evil\nGITHUB_ENV=/evil\nDYLD_INSERT_LIBRARIES=evil.dylib\n' > "${_ws_env}/env.custom"
+# Whitespace-only lines in env.custom must be skipped without false security error messages
+printf '   \n\t\t\nCLEAN_VAR=1\n' > "${_ws_env}/env.custom"
 invoke_script --workspace "$_ws_env"
-printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "extended blocklist vars in env.custom are blocked"
-if [[ ! -s "${_ws_env}/env.load" ]]; then
+_rc=$?
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "whitespace-only lines in env.custom skipped without error"
+if [[ $_rc -eq 0 ]] \
+	&& grep -qx 'CLEAN_VAR=1' "${_ws_env}/env.load" 2> /dev/null \
+	&& ! grep -qF "Invalid environment variable blocked" "${tmp_dir}/last_output"; then
 	_pass
 else
-	_fail "env.load should be empty for blocked vars" "$(cat "${_ws_env}/env.load" 2> /dev/null)"
+	_fail "whitespace-only line triggered false error or missing var" "$(last_output)"
+fi
+
+# Extended blocklist: BASH_ENV, ENV, PROMPT_COMMAND, GITHUB_ENV, GITHUB_STATE, DYLD_INSERT_LIBRARIES, GLIBC_TUNABLES, GCONV_PATH, SHELLOPTS, BASHOPTS must be blocked
+printf 'BASH_ENV=/evil\nENV=/evil\nPROMPT_COMMAND=evil\nGITHUB_ENV=/evil\nGITHUB_STATE=/evil\nDYLD_INSERT_LIBRARIES=evil.dylib\nGLIBC_TUNABLES=glibc.malloc.check=3\nGCONV_PATH=/evil\nSHELLOPTS=xtrace\nBASHOPTS=extdebug\n' > "${_ws_env}/env.custom"
+invoke_script --workspace "$_ws_env"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "extended blocklist vars in env.custom are blocked"
+if [[ -f "${_ws_env}/env.load" && ! -s "${_ws_env}/env.load" ]]; then
+	_pass
+else
+	_fail "env.load should exist and be empty for blocked vars" "$(cat "${_ws_env}/env.load" 2> /dev/null)"
+fi
+
+# CRLF line endings and missing trailing newline in env.custom are handled cleanly
+printf 'CRLF_VAR_ONE=alpha\r\n\r\nCRLF_VAR_TWO=beta' > "${_ws_env}/env.custom"
+invoke_script --workspace "$_ws_env"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "CRLF and missing final newline in env.custom preserved without CR"
+if [[ $(wc -l < "${_ws_env}/env.load") -eq 2 ]] \
+	&& grep -qx 'CRLF_VAR_ONE=alpha' "${_ws_env}/env.load" \
+	&& grep -qx 'CRLF_VAR_TWO=beta' "${_ws_env}/env.load" \
+	&& ! grep -q $'\r' "${_ws_env}/env.load"; then
+	_pass
+else
+	_fail "CRLF or missing trailing newline handling failed" "$(cat -v "${_ws_env}/env.load" 2> /dev/null)"
+fi
+
+# Blocked env var error redacts value so secrets are never printed to logs
+printf 'SECRET_CONN_URL=postgres://u:super_secret_pw@db/app?a=1&b=2\n' > "${_ws_env}/env.custom"
+invoke_script --workspace "$_ws_env"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "blocked env error redacts secret value in logs"
+if grep -qF "SECRET_CONN_URL=<redacted>" "${tmp_dir}/last_output" \
+	&& ! grep -qF "super_secret_pw" "${tmp_dir}/last_output"; then
+	_pass
+else
+	_fail "secret value leaked or redaction missing in output" "$(last_output)"
+fi
+
+# Symlinked env.custom must be rejected without leaking target content
+_ws_sym_env="${tmp_dir}/ws_sym_env"
+mkdir -p "$_ws_sym_env"
+ln -sf "${tmp_dir}/secret_target" "${_ws_sym_env}/env.custom"
+run_test "symlinked env.custom exits 1" 1 \
+	--workspace "$_ws_sym_env"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "symlinked env.custom does not leak target content"
+if ! grep -qF "TOP_SECRET_HOST_TOKEN" "${tmp_dir}/last_output" 2> /dev/null; then
+	_pass
+else
+	_fail "symlinked env.custom leaked target content" "$(last_output)"
 fi
 
 # Dangerous characters in env.custom value must be blocked
@@ -540,11 +724,42 @@ _ws_host_ignore="${tmp_dir}/ws_host_ignore"
 mkdir -p "$_ws_host_ignore"
 printf 'EVIL_VAR=bad\n' > "${_ws_host_ignore}/env.host"
 invoke_script --workspace "$_ws_host_ignore" inputs_use_host_env="false"
+_rc=$?
 printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "env.host ignored when inputs_use_host_env=false"
-if ! grep -q "EVIL_VAR" "${_ws_host_ignore}/env.load" 2> /dev/null; then
+if [[ $_rc -eq 0 ]] && ! grep -q "EVIL_VAR" "${_ws_host_ignore}/env.load" 2> /dev/null; then
 	_pass
 else
-	_fail "env.host was loaded even though inputs_use_host_env=false" "$(cat "${_ws_host_ignore}/env.load" 2> /dev/null)"
+	_fail "env.host was loaded even though inputs_use_host_env=false (rc=$_rc)" "$(cat "${_ws_host_ignore}/env.load" 2> /dev/null)"
+fi
+
+# Pre-existing symlink at env.host must be unlinked (target not clobbered) and env files set to 0600
+_ws_host_sym="${tmp_dir}/ws_host_sym"
+mkdir -p "$_ws_host_sym"
+printf 'DO_NOT_CLOBBER\n' > "${tmp_dir}/protected_host_target"
+ln -sf "${tmp_dir}/protected_host_target" "${_ws_host_sym}/env.host"
+invoke_script --workspace "$_ws_host_sym" inputs_use_host_env="true"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "pre-existing env.host symlink unlinked without clobbering target and mode is 600"
+_env_host_perm=$(stat -c '%a' "${_ws_host_sym}/env.host" 2> /dev/null)
+if [[ $(cat "${tmp_dir}/protected_host_target") == "DO_NOT_CLOBBER" ]] \
+	&& [[ ! -L "${_ws_host_sym}/env.host" ]] \
+	&& [[ $_env_host_perm == "600" ]]; then
+	_pass
+else
+	_fail "env.host symlink clobbered target or permissions ($_env_host_perm) != 600" ""
+fi
+
+# Failed input validation must not dump env.host when inputs_use_host_env=true
+_ws_no_dump="${tmp_dir}/ws_no_dump"
+mkdir -p "$_ws_no_dump"
+run_test "invalid input with inputs_use_host_env=true exits 1" 1 \
+	--workspace "$_ws_no_dump" \
+	inputs_use_host_env="true" \
+	inputs_custom_docker_commands="--rm"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "failed validation does not dump env.host into workspace"
+if [[ ! -e "${_ws_no_dump}/env.host" && ! -e "${_ws_no_dump}/env.load" ]]; then
+	_pass
+else
+	_fail "env.host or env.load created before input validation completed" ""
 fi
 
 # Pre-existing stale env.load must not be loaded when use_host=false and env.custom is absent
@@ -610,6 +825,61 @@ invoke_script inputs_custom_docker_commands='--volume ${wd}/sub:/host'
 # shellcheck disable=SC2016
 assert_docker '${wd} expanded to /home/gh in volume arg' "/home/gh/sub:/host"
 
+# Valid user, workdir, read-only volume, and fractional cpus flags accepted
+invoke_script inputs_custom_docker_commands="$(printf -- '-u 1001:1001\n-w /opt/work\n--volume /tmp:/tmp:ro\n--cpus 1.5\n')"
+assert_docker "valid -u, -w, :ro volume, and decimal --cpus passed to docker run" "-u 1001:1001 -w /opt/work --volume /tmp:/tmp:ro --cpus 1.5"
+
+# Blocked env vars in --env / -e must exit 1 (cannot bypass check_env_var)
+run_test "--env LD_PRELOAD in custom docker commands exits 1" 1 \
+	inputs_custom_docker_commands="--env LD_PRELOAD=/evil.so"
+
+run_test "-e PATH in custom docker commands exits 1" 1 \
+	inputs_custom_docker_commands="-e PATH=/evil"
+
+# Valueless -e VAR (host env inheritance bypass) must exit 1
+run_test "valueless -e VAR in custom docker commands exits 1" 1 \
+	inputs_custom_docker_commands="-e HOME"
+
+# Docker socket mount and smuggled extra flags on one line must exit 1
+run_test "docker.sock mount in --volume exits 1" 1 \
+	inputs_custom_docker_commands="--volume /var/run/docker.sock:/var/run/docker.sock"
+
+run_test "docker.sock/ trailing-slash mount in --volume exits 1" 1 \
+	inputs_custom_docker_commands="--volume /var/run/docker.sock/:/tmp/sock"
+
+# Secret value in --env reaches docker run while redacted in step summary and error logs
+invoke_script inputs_custom_docker_commands="--env MY_API_SECRET=ultra_secret_token_777"
+assert_docker "--env secret passed to docker run" "--env MY_API_SECRET=ultra_secret_token_777"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "--env secret value redacted in stdout and GITHUB_STEP_SUMMARY"
+if grep -qF "MY_API_SECRET=<redacted>" "${tmp_dir}/gh_summary" \
+	&& ! grep -qF "ultra_secret_token_777" "${tmp_dir}/gh_summary" \
+	&& ! grep -qF "ultra_secret_token_777" "${tmp_dir}/last_output"; then
+	_pass
+else
+	_fail "--env secret value leaked to summary or stdout" "$(last_output)"
+fi
+
+invoke_script MOCK_DOCKER_FAIL="run" inputs_custom_docker_commands="-e MY_API_SECRET=ultra_secret_token_777"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "-e secret value redacted in docker run error log"
+if grep -qF "MY_API_SECRET=<redacted>" "${tmp_dir}/last_output" \
+	&& ! grep -qF "ultra_secret_token_777" "${tmp_dir}/last_output"; then
+	_pass
+else
+	_fail "-e secret value leaked on docker run failure" "$(last_output)"
+fi
+
+run_test "extra flag smuggled on --volume line exits 1" 1 \
+	inputs_custom_docker_commands="--volume /tmp:/tmp --privileged"
+
+run_test "path traversal in --workdir exits 1" 1 \
+	inputs_custom_docker_commands="--workdir /app/../../etc"
+
+run_test "zero --memory value exits 1" 1 \
+	inputs_custom_docker_commands="--memory 0"
+
+run_test "zero --cpus value exits 1" 1 \
+	inputs_custom_docker_commands="--cpus 0"
+
 #─────────────────────────────────────────────────────
 section "Security Hardening & Platform Precedence"
 #─────────────────────────────────────────────────────
@@ -654,9 +924,10 @@ else _fail "-u 1001:1001 not found in docker run" "$(docker_log)"; fi
 # No -u when inputs_use_root=true
 invoke_script inputs_use_root="true"
 printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "inputs_use_root=true -> no -u flag in docker run"
-if ! grep -qF -- "-u 1001" "${tmp_dir}/docker_calls.log" 2> /dev/null; then
+if grep -q "^run " "${tmp_dir}/docker_calls.log" 2> /dev/null \
+	&& ! grep -qF -- "-u 1001" "${tmp_dir}/docker_calls.log" 2> /dev/null; then
 	_pass
-else _fail "-u 1001 should not appear in docker run" "$(docker_log)"; fi
+else _fail "-u 1001 should not appear in docker run (or docker run did not execute)" "$(docker_log)"; fi
 
 # Workspace volume mount present
 invoke_script
@@ -685,17 +956,53 @@ printf 'FROM alpine:edge\nWORKDIR /bad;path\n' > "${_ws_df}/badwd.Dockerfile"
 invoke_script --workspace "$_ws_df" inputs_dockerfile="badwd.Dockerfile"
 assert_gh_output "invalid WORKDIR retains default wd=/home/gh" "wd=/home/gh"
 
-# Standard path docker build failure exits 1 and cleans up temporary Dockerfile
+# Path-traversing WORKDIR logs warning and retains default /home/gh
+printf 'FROM alpine:edge\nWORKDIR /app/../../etc\n' > "${_ws_df}/travwd.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="travwd.Dockerfile"
+assert_gh_output "path-traversing WORKDIR retains default wd=/home/gh" "wd=/home/gh"
+
+# Sequential relative WORKDIR resolves against prior WORKDIR in stage
+printf 'FROM alpine:edge\nWORKDIR /opt\nWORKDIR app\n' > "${_ws_df}/relwd.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="relwd.Dockerfile"
+assert_gh_output "sequential relative WORKDIR resolves to /opt/app" "wd=/opt/app"
+
+# Multi-stage Dockerfile without WORKDIR in final stage does not leak builder WORKDIR
+printf 'FROM alpine:edge AS builder\nWORKDIR /tmp/stage1\nFROM alpine:edge\nRUN true\n' > "${_ws_df}/multistage_none.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="multistage_none.Dockerfile"
+assert_gh_output "multi-stage without final WORKDIR retains default wd=/home/gh" "wd=/home/gh"
+
+# Multi-stage Dockerfile with WORKDIR in final stage uses final stage WORKDIR
+printf 'FROM alpine:edge AS builder\nWORKDIR /tmp/stage1\nFROM alpine:edge\nWORKDIR /srv/final\n' > "${_ws_df}/multistage_final.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="multistage_final.Dockerfile"
+assert_gh_output "multi-stage with final WORKDIR uses wd=/srv/final" "wd=/srv/final"
+
+# Multi-stage Dockerfile inheriting from earlier named stage inherits its WORKDIR
+printf 'FROM alpine:edge AS base\nWORKDIR /opt/inherited\nFROM base\nRUN true\n' > "${_ws_df}/multistage_inherit.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="multistage_inherit.Dockerfile"
+assert_gh_output "multi-stage FROM <alias> inherits stage WORKDIR" "wd=/opt/inherited"
+
+# Multiline RUN with inline 'from ... import ...' and backslash continuation does not reset WORKDIR
+printf 'FROM alpine:edge\nWORKDIR /workspace\nRUN echo ok \\\n  # comment inside continuation\n  from_continuation && python3 -c '\''\nfrom pathlib import Path\n'\''\n' > "${_ws_df}/multiline_run.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="multiline_run.Dockerfile"
+assert_gh_output "multiline RUN with 'from ...' does not clobber WORKDIR" "wd=/workspace"
+
+# docker build uses $workspace as build context in both fast-path and standard path
+assert_docker "fast-path docker build uses workspace as build context" "-t custom_dockerfile ${_ws_df}"
+invoke_script --workspace "$_ws_df"
+assert_docker "standard docker build uses workspace as build context" "-t qbt_builder ${_ws_df}"
+
+# Standard path docker build failure exits 1, cleans up temporary Dockerfile, and does not dump env.host
 _ws_fail="${tmp_dir}/ws_fail"
 mkdir -p "$_ws_fail"
 run_test "standard docker build failure exits 1" 1 \
 	--workspace "$_ws_fail" \
+	inputs_use_host_env="true" \
 	MOCK_DOCKER_FAIL="build"
-printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "standard docker build failure cleans up temp Dockerfile"
-if [[ ! -f "${_ws_fail}/qbt_builder_dockerfile" ]]; then
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "standard docker build failure cleans up temp Dockerfile and skips env.host dump"
+if [[ ! -f "${_ws_fail}/qbt_builder_dockerfile" && ! -e "${_ws_fail}/env.host" && ! -e "${_ws_fail}/env.load" ]]; then
 	_pass
 else
-	_fail "temporary Dockerfile left behind after build failure" ""
+	_fail "temporary Dockerfile or env.host left behind after build failure" ""
 fi
 
 # Fast-path docker build failure exits 1 and cleans up temporary Dockerfile
@@ -750,15 +1057,76 @@ else
 	_fail "validate_input should exit 1 on unknown type" ""
 fi
 
-printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "to_gh_env and to_gh_output reject blocked variables"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "to_gh_env and to_gh_output reject blocked and multiline variables"
 if (
 	# shellcheck source=/dev/null
 	source "$script_path" 2> /dev/null
-	! to_gh_env "PATH=/evil" 2> /dev/null && ! to_gh_output "LD_PRELOAD=evil.so" 2> /dev/null
+	! to_gh_env "PATH=/evil" 2> /dev/null \
+		&& ! to_gh_output "LD_PRELOAD=evil.so" 2> /dev/null \
+		&& ! to_gh_env $'SAFE=1\nLD_PRELOAD=evil.so' 2> /dev/null \
+		&& ! to_gh_output $'SAFE=1\nPATH=/evil' 2> /dev/null
 ); then
 	_pass
 else
-	_fail "to_gh_env / to_gh_output should return non-zero for blocked vars" ""
+	_fail "to_gh_env / to_gh_output should return non-zero for blocked or multiline vars" ""
+fi
+
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "Re-sourcing script twice in same set -e shell succeeds without errors"
+_resource_err=$(
+	{
+		set -e
+		# shellcheck source=/dev/null
+		source "$script_path"
+		# shellcheck source=/dev/null
+		source "$script_path"
+	} 2>&1
+) && _resource_rc=0 || _resource_rc=$?
+if [[ $_resource_rc -eq 0 && -z $_resource_err ]]; then
+	_pass
+else
+	_fail "re-sourcing failed (rc=$_resource_rc)" "$_resource_err"
+fi
+
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "Execution with unset GITHUB_ENV, GITHUB_OUTPUT, GITHUB_STEP_SUMMARY succeeds"
+mkdir -p "${tmp_dir}/ws_unset_gh"
+if env -i \
+	HOME="${HOME:-/root}" \
+	PATH="${tmp_dir}:${PATH}" \
+	GITHUB_WORKSPACE="${tmp_dir}/ws_unset_gh" \
+	RUNNER_ARCH="X64" \
+	bash "$script_path" > "${tmp_dir}/unset_gh.out" 2>&1; then
+	_pass
+else
+	_fail "script failed when GITHUB_* file vars were unset" "$(cat "${tmp_dir}/unset_gh.out")"
+fi
+
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "Execution without docker in PATH exits 1 cleanly"
+mkdir -p "${tmp_dir}/no_docker_bin" "${tmp_dir}/ws_nodocker"
+ln -sf "$(command -v bash)" "${tmp_dir}/no_docker_bin/bash"
+if ! env -i \
+	HOME="${HOME:-/root}" \
+	PATH="${tmp_dir}/no_docker_bin" \
+	GITHUB_WORKSPACE="${tmp_dir}/ws_nodocker" \
+	RUNNER_ARCH="X64" \
+	"${tmp_dir}/no_docker_bin/bash" "$script_path" > "${tmp_dir}/nodocker.out" 2>&1 \
+	&& grep -qF "Docker CLI is not installed" "${tmp_dir}/nodocker.out"; then
+	_pass
+else
+	_fail "missing docker binary did not exit 1 with expected message" "$(cat "${tmp_dir}/nodocker.out" 2> /dev/null)"
+fi
+
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "Sourcing and calling validation functions preserves caller LC_ALL"
+if (
+	# shellcheck source=/dev/null
+	source "$script_path" 2> /dev/null
+	LC_ALL="$_utf8_loc"
+	check_env_var "GOOD_VAR=1"
+	validate_input "linux/amd64" "platform"
+	[[ $LC_ALL == "$_utf8_loc" ]]
+); then
+	_pass
+else
+	_fail "validation functions mutated caller LC_ALL" ""
 fi
 
 #─────────────────────────────────────────────────────
