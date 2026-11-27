@@ -165,8 +165,8 @@ validate_input() {
 			fi
 			;;
 		"dockerfile_path")
-			# Restrict to workspace-relative paths only, no '..' path segments, leading '/', or leading '-'
-			if [[ $input =~ (^|/)\.\.(/|$)|^/|^-|// ]] || [[ ${#input} -gt 256 ]] || [[ ! $input =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+			# Restrict to workspace-relative file paths only: no '..' segments, bare '.', leading/trailing '/', or leading '-'
+			if [[ $input =~ (^|/)\.\.(/|$)|^\.$|^/|/$|^-|// ]] || [[ ${#input} -gt 256 ]] || [[ ! $input =~ ^[a-zA-Z0-9._/-]+$ ]]; then
 				log_error "Security: Invalid dockerfile path blocked: $input"
 				exit 1
 			fi
@@ -237,7 +237,7 @@ validate_workspace_file() {
 	local IFS='/'
 	local -a parts
 
-	if [[ -z $rel_path || $rel_path == /* || $rel_path == *$'\n'* || $rel_path == *$'\r'* ]]; then
+	if [[ -z $rel_path || $rel_path == /* || $rel_path == */ || $rel_path == *$'\n'* || $rel_path == *$'\r'* ]]; then
 		log_error "Security: Invalid workspace-relative path: $rel_path"
 		return 1
 	fi
@@ -250,6 +250,10 @@ validate_workspace_file() {
 	read -ra parts <<< "$rel_path"
 	for part in "${parts[@]}"; do
 		[[ -z $part || $part == "." ]] && continue
+		if [[ $part == ".." ]]; then
+			log_error "Security: Path traversal is not allowed in workspace path: $rel_path"
+			return 1
+		fi
 		current_path="${current_path}/${part}"
 		if [[ -L $current_path ]]; then
 			log_error "Security: Symbolic links are not allowed in workspace path: $rel_path"
@@ -318,6 +322,10 @@ validate_gh_file_target() {
 	fi
 	if [[ -p $file_path ]]; then
 		log_error "Security: ${label} must not be a named pipe: $file_path"
+		return 1
+	fi
+	if [[ -e $file_path && ! -f $file_path && $file_path != "/dev/null" ]]; then
+		log_error "Security: ${label} must be a regular file: $file_path"
 		return 1
 	fi
 	if [[ $file_path == */* ]]; then
@@ -578,19 +586,9 @@ detect_os_fallback_with_metadata() {
 	local history_check
 	history_check=$(jq -r --arg plat "${inputs_platform:-}" "try ((${_jq_image_selector}.history // [])[].created_by // \"\")" <<< "$docker_inspect_json" 2> /dev/null | LC_ALL=C grep -i -E '(^|[^a-zA-Z0-9_])(alpine|debian|ubuntu)([^a-zA-Z0-9_]|$)' | head -1)
 
-	if [[ -n $history_check ]]; then
+	if [[ -n $history_check ]] && [[ ${history_check,,} =~ (^|[^a-z0-9_])(alpine|debian|ubuntu)([^a-z0-9_]|$) ]]; then
+		detected_os="${BASH_REMATCH[2]}"
 		log_debug "Found OS in history: $history_check" >&2
-		case "${history_check,,}" in
-			*alpine*)
-				detected_os="alpine"
-				;;
-			*debian*)
-				detected_os="debian"
-				;;
-			*ubuntu*)
-				detected_os="ubuntu"
-				;;
-		esac
 	fi
 
 	# If still no match, use name parsing fallback
@@ -611,8 +609,9 @@ detect_os_fallback() {
 
 	log_debug "Using name-only fallback detection" >&2
 
-	# Strip optional docker.io/ and known official/arch prefixes without discarding org names (e.g., alpine/git)
+	# Strip optional @digest, docker.io/, and known official/arch prefixes without discarding org names (e.g., alpine/git)
 	local base_image="${image,,}"
+	base_image="${base_image%%@*}"
 	base_image="${base_image#docker.io/}"
 	if [[ $base_image =~ ^(library|amd64|i386|arm32v6|arm32v7|arm64v8|ppc64le|s390x|riscv64)/(.+)$ ]]; then
 		base_image="${BASH_REMATCH[2]}"
@@ -960,7 +959,7 @@ extract_dockerfile_workdir() {
 	local eof_reached=false
 	local -A stage_wds=()
 	local -A stage_invalids=()
-	local run_heredoc_re="^([Rr][Uu][Nn])([[:space:]].*[^<]|[[:space:]])<<(-?)[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?([[:space:]]*(>[>]?[[:space:]]*[^[:space:]'\"]+))?[[:space:]]*\$"
+	local run_heredoc_re="^([Rr][Uu][Nn])([[:space:]].*[^<]|[[:space:]])<<(-?)[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?([[:space:]]*([0-9]*>[>&]?|&>|\|\|?|&&|;)[^'\"]*)?[[:space:]]*\$"
 	local copy_heredoc_re="^([Cc][Oo][Pp][Yy]|[Aa][Dd][Dd])([[:space:]].*[^<]|[[:space:]])<<(-?)[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?[[:space:]]+(['\"][^'\"]+['\"]|[^[:space:]'\"]+)[[:space:]]*\$"
 
 	while [[ $eof_reached == false ]]; do
@@ -1353,7 +1352,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		cleanup_dockerfile=false
 		log_info "Fast-path: using provided Dockerfile: $inputs_dockerfile"
 
-		case "$inputs_dockerfile" in
+		case "${inputs_dockerfile,,}" in
 			http://* | https://* | ftp://* | git://* | ssh://* | file://*)
 				log_error "Security: Remote Dockerfiles not allowed for security reasons"
 				exit 1
@@ -1410,10 +1409,10 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 		printf '%s\n' "$dockerfile_content"
 		if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
 			{
-				log_info "Using Dockerfile: $dockerfile_path"
-				printf '%b\n' '```bash'
-				printf '%s\n' "$dockerfile_content"
-				printf '%b\n' '```'
+				log_info "Using Dockerfile: $dockerfile_path" \
+					&& printf '%b\n' '```bash' \
+					&& printf '%s\n' "$dockerfile_content" \
+					&& printf '%b\n' '```'
 			} >> "$GITHUB_STEP_SUMMARY" || {
 				log_error "Failed to write to GITHUB_STEP_SUMMARY"
 				[[ $cleanup_dockerfile == true ]] && rm -f "$dockerfile_path"
@@ -1515,10 +1514,18 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 	rm -f "$dockerfile_path"
 	if [[ $inputs_os_id =~ ^ghcr\.io/userdocs/ ]]; then
 		# Special handling for userdocs images - they already have user setup
-		generate_userdocs_dockerfile "$detected_os" > "$dockerfile_path"
+		generate_userdocs_dockerfile "$detected_os" > "$dockerfile_path" || {
+			log_error "Failed to generate Dockerfile at $dockerfile_path"
+			rm -f "$dockerfile_path"
+			exit 1
+		}
 	else
 		# Standard images - need full user setup
-		generate_standard_dockerfile "$detected_os" > "$dockerfile_path"
+		generate_standard_dockerfile "$detected_os" > "$dockerfile_path" || {
+			log_error "Failed to generate Dockerfile at $dockerfile_path"
+			rm -f "$dockerfile_path"
+			exit 1
+		}
 	fi
 	if [[ ! -s $dockerfile_path ]]; then
 		log_error "Failed to generate Dockerfile at $dockerfile_path"
@@ -1533,9 +1540,9 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 	printf '%s\n' "$dockerfile_content"
 	if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
 		{
-			printf '%b\n' '```bash'
-			printf '%s\n' "$dockerfile_content"
-			printf '%b\n' '```'
+			printf '%b\n' '```bash' \
+				&& printf '%s\n' "$dockerfile_content" \
+				&& printf '%b\n' '```'
 		} >> "$GITHUB_STEP_SUMMARY" || {
 			log_error "Failed to write to GITHUB_STEP_SUMMARY"
 			rm -f "$dockerfile_path"

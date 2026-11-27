@@ -382,6 +382,9 @@ run_test "https remote Dockerfile exits 1" 1 \
 run_test "file:// URI Dockerfile exits 1" 1 \
 	inputs_dockerfile="file:///etc/passwd"
 
+assert_output "uppercase HTTPS:// remote Dockerfile blocked as remote" "Remote Dockerfiles not allowed" \
+	inputs_dockerfile="HTTPS://evil.example.com/Dockerfile"
+
 run_test "missing Dockerfile exits 1" 1 \
 	inputs_dockerfile="does_not_exist.txt"
 
@@ -414,6 +417,15 @@ printf 'FROM alpine:edge\n' > "${_ws_df}/my..Dockerfile"
 run_test "Dockerfile filename with consecutive dots is accepted" 0 \
 	--workspace "$_ws_df" \
 	inputs_dockerfile="my..Dockerfile"
+
+# Trailing slash or bare '.' on inputs_dockerfile is rejected as an invalid dockerfile path
+assert_output "trailing slash on inputs_dockerfile blocked" "Invalid dockerfile path blocked" \
+	--workspace "$_ws_df" \
+	inputs_dockerfile="my.Dockerfile/"
+
+run_test "bare dot inputs_dockerfile (.) exits 1" 1 \
+	--workspace "$_ws_df" \
+	inputs_dockerfile="."
 
 # Symlinked Dockerfile pointing outside workspace must be blocked without leaking target content
 printf 'TOP_SECRET_HOST_TOKEN=xyz987\n' > "${tmp_dir}/secret_target"
@@ -596,6 +608,13 @@ invoke_script \
 	inputs_os_version_id="1.0" \
 	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{}},"history":[{"created_by":"ENV DEBIAN_FRONTEND=noninteractive"}]}}}'
 assert_dockerfile "DEBIAN_FRONTEND in history does not false-match debian" "if command -v apt-get"
+
+# Section 3: ALPINE_MIRROR env var alongside word-bounded debian token classifies as debian (not alpine)
+invoke_script \
+	inputs_os_id="ghcr.io/userdocs/qbt-nox" \
+	inputs_os_version_id="1.0" \
+	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{}},"history":[{"created_by":"RUN ALPINE_MIRROR=none apt-get install -y debian-archive-keyring"}]}}}'
+assert_dockerfile "history extracts word-bounded debian despite ALPINE_MIRROR prefix" "apt-get update"
 
 # Multi-arch Buildx JSON with leading empty attestation entry still finds platform Labels
 invoke_script \
@@ -1181,6 +1200,18 @@ EOF
 invoke_script --workspace "$_ws_df" inputs_dockerfile="copy_heredoc.Dockerfile"
 assert_gh_output "BuildKit COPY <<EOF with relative destination preserves WORKDIR" "wd=/app_rel_copy"
 
+# BuildKit piped RUN <<'EOF' | sh ignores heredoc WORKDIR/FROM
+cat > "${_ws_df}/pipe_heredoc.Dockerfile" << 'EOF'
+FROM alpine:edge
+WORKDIR /app_pipe_ok
+RUN cat <<'EOF_PIPE' | sh
+WORKDIR /wrong_pipe_wd
+FROM scratch
+EOF_PIPE
+EOF
+invoke_script --workspace "$_ws_df" inputs_dockerfile="pipe_heredoc.Dockerfile"
+assert_gh_output "BuildKit piped RUN <<EOF | sh preserves WORKDIR" "wd=/app_pipe_ok"
+
 # Bash <<< here-string and << bitshift inside RUN must NOT falsely open a BuildKit heredoc
 cat > "${_ws_df}/herestring_bitshift.Dockerfile" << 'EOF'
 FROM alpine:edge
@@ -1384,6 +1415,23 @@ if (
 	_pass
 else
 	_fail "validation/parsing functions mutated caller LC_ALL/IFS or failed under custom IFS" ""
+fi
+
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "validate_workspace_file standalone rejects .. traversal and trailing slash with rc=1"
+if (
+	# shellcheck source=/dev/null
+	source "$script_path" 2> /dev/null
+	# shellcheck disable=SC2034
+	workspace="$_ws_df"
+	validate_workspace_file "../nonexistent_outside" 2> /dev/null
+	rc1=$?
+	validate_workspace_file "my.Dockerfile/" 2> /dev/null
+	rc2=$?
+	[[ $rc1 -eq 1 && $rc2 -eq 1 ]]
+); then
+	_pass
+else
+	_fail "validate_workspace_file did not return 1 for .. or trailing slash" ""
 fi
 
 #─────────────────────────────────────────────────────
