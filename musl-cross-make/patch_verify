@@ -3,39 +3,236 @@
 #################################################################################################################################################
 # Global color variables for main script sections
 #################################################################################################################################################
-readonly color_red="\e[31m"
-readonly color_green="\e[32m"
-readonly color_yellow="\e[33m"
-readonly color_blue="\e[34m"
-readonly color_cyan="\e[36m"
-readonly color_magenta="\e[35m"
-readonly color_gray="\e[37m"
-readonly color_end="\e[0m"
-readonly text_bold="\e[1m"
+color_red="\e[31m"
+color_green="\e[32m"
+color_yellow="\e[33m"
+color_blue="\e[34m"
+color_cyan="\e[36m"
+color_magenta="\e[35m"
+color_gray="\e[37m"
+color_end="\e[0m"
+text_bold="\e[1m"
 
-# Check patch headers for '..' path traversal components before invoking git/patch
-patch_has_path_traversal() {
+# Verify a directory is the root of its own git worktree (supports .git dirs,
+# linked worktrees, and submodules without walking up to an enclosing parent repo).
+is_git_repo_root() {
+	local dir="$1"
+	[[ -e $dir/.git ]] && command -v git > /dev/null 2>&1 || return 1
+	local toplevel phys_dir
+	toplevel=$(git -C "$dir" rev-parse --show-toplevel 2> /dev/null) || return 1
+	phys_dir=$(cd "$dir" 2> /dev/null && pwd -P) || return 1
+	[[ $toplevel == "$phys_dir" ]]
+}
+
+# Validate a single path from a diff header for absolute paths, '..' traversal,
+# or symbolic link traversal (both intra-patch and on-disk).
+check_patch_target_path() {
+	local raw_path="$1"
+	local strip_p1="$2"
+	local target_dir="$3"
+	local is_git_repo="$4"
+	local is_symlink_def="$5"
+	local created_syms="$6"
+
+	if [[ $raw_path == \"* ]]; then
+		raw_path="${raw_path%\"$'\t'*}"
+		raw_path="${raw_path#\"}"
+		raw_path="${raw_path%\"}"
+		raw_path="${raw_path//\\056/.}"
+		raw_path="${raw_path//\\56/.}"
+		raw_path="${raw_path//\\057//}"
+		raw_path="${raw_path//\\57//}"
+		raw_path="${raw_path//\\\"/\"}"
+		raw_path="${raw_path//\\\\/\\}"
+	fi
+
+	[[ $raw_path == "/dev/null" ]] && return 0
+
+	if [[ $raw_path == /* ]]; then
+		patch_security_error="Security: patch contains absolute target path"
+		return 1
+	fi
+
+	if [[ $raw_path == ".." || $raw_path == ../* || $raw_path == */../* || $raw_path == */.. ]]; then
+		patch_security_error="Security: patch contains parent directory traversal ('..')"
+		return 1
+	fi
+
+	local rel_path="$raw_path"
+	if [[ $strip_p1 == "true" ]]; then
+		[[ $raw_path == */* ]] || return 0
+		rel_path="${raw_path#*/}"
+	fi
+
+	if [[ -z $rel_path || $rel_path == /* || $rel_path == ".." || $rel_path == ../* || $rel_path == */../* || $rel_path == */.. ]]; then
+		patch_security_error="Security: patch contains parent directory traversal ('..')"
+		return 1
+	fi
+
+	checked_rel_path="$rel_path"
+
+	local rem="$rel_path" prefix="" seg
+	while [[ $rem == */* ]]; do
+		seg="${rem%%/*}"
+		rem="${rem#*/}"
+		[[ -z $seg || $seg == "." ]] && continue
+		prefix="${prefix:+$prefix/}$seg"
+		if [[ $'\n'$created_syms == *$'\n'"$prefix"$'\n'* || -L "$target_dir/$prefix" ]]; then
+			patch_security_error="Security: patch target traverses symbolic link"
+			return 1
+		fi
+	done
+
+	if [[ $is_git_repo == "false" && $is_symlink_def == "false" && -L "$target_dir/$rel_path" ]]; then
+		patch_security_error="Security: patch target is a symbolic link"
+		return 1
+	fi
+
+	return 0
+}
+
+# Parse diff headers statefully (skipping hunk body lines) to reject path traversal,
+# absolute paths, and symlink escapes before invoking git/patch.
+validate_patch_security() {
 	local patch_file="$1"
-	grep -qE '^(\+\+\+|---|diff --git )[[:space:]].*(^|[/"[:space:]])\.\.(/|[[:space:]"]|$)' -- "$patch_file" 2> /dev/null
+	local target_dir="$2"
+	local is_git_repo="$3"
+
+	patch_security_error=""
+	local checked_rel_path=""
+	local rem_old=0 rem_new=0 is_symlink="false" cur_rel="" created_syms=""
+	local line hdr_tail old_spec new_spec sym_target
+
+	while IFS= read -r line || [[ -n $line ]]; do
+		if ((rem_old > 0 || rem_new > 0)); then
+			case "${line:0:1}" in
+				\\)
+					continue
+					;;
+				' ' | '' | $'\r')
+					((rem_old > 0)) && ((rem_old--))
+					((rem_new > 0)) && ((rem_new--))
+					continue
+					;;
+				'-')
+					if ((rem_old > 0)); then
+						((rem_old--))
+						continue
+					fi
+					;;
+				'+')
+					if ((rem_new > 0)); then
+						if [[ $is_symlink == "true" ]]; then
+							sym_target="${line:1}"
+							sym_target="${sym_target%$'\r'}"
+							if [[ $sym_target == /* ]]; then
+								patch_security_error="Security: patch creates escaping symbolic link"
+								return 1
+							fi
+							local depth=0 tmp_rel="$cur_rel" part
+							while [[ $tmp_rel == */* ]]; do
+								part="${tmp_rel%%/*}"
+								tmp_rel="${tmp_rel#*/}"
+								[[ -n $part && $part != "." ]] && ((++depth))
+							done
+							local tmp_sym="${sym_target}/"
+							while [[ -n $tmp_sym ]]; do
+								part="${tmp_sym%%/*}"
+								tmp_sym="${tmp_sym#*/}"
+								if [[ $part == ".." ]]; then
+									((--depth))
+									if ((depth < 0)); then
+										patch_security_error="Security: patch creates escaping symbolic link"
+										return 1
+									fi
+								elif [[ -n $part && $part != "." ]]; then
+									((++depth))
+								fi
+							done
+						fi
+						((rem_new--))
+						continue
+					fi
+					;;
+			esac
+			rem_old=0
+			rem_new=0
+		fi
+
+		line="${line%$'\r'}"
+		case "$line" in
+			'@@ -'*' +'*' @@'*)
+				hdr_tail="${line#@@ -}"
+				old_spec="${hdr_tail%% *}"
+				hdr_tail="${hdr_tail#* +}"
+				new_spec="${hdr_tail%% *}"
+				if [[ $old_spec =~ ^[0-9]+(,[0-9]+)?$ && $new_spec =~ ^[0-9]+(,[0-9]+)?$ ]]; then
+					if [[ $old_spec == *,* ]]; then rem_old="${old_spec#*,}"; else rem_old=1; fi
+					if [[ $new_spec == *,* ]]; then rem_new="${new_spec#*,}"; else rem_new=1; fi
+					continue
+				fi
+				;;
+			'diff --git '*)
+				is_symlink="false"
+				cur_rel=""
+				hdr_tail="${line#diff --git }"
+				hdr_tail="${hdr_tail//\\056/.}"
+				hdr_tail="${hdr_tail//\\56/.}"
+				hdr_tail="${hdr_tail//\\057//}"
+				hdr_tail="${hdr_tail//\\57//}"
+				if [[ $hdr_tail =~ (^|[[:space:]\"/])\.\.(/|[[:space:]\"]|$) ]]; then
+					patch_security_error="Security: patch contains parent directory traversal ('..')"
+					return 1
+				fi
+				;;
+			'new file mode 120000' | 'new mode 120000')
+				is_symlink="true"
+				[[ -n $cur_rel ]] && created_syms+="${cur_rel}"$'\n'
+				;;
+			'--- '* | '---'$'\t'* | '+++ '* | '+++'$'\t'*)
+				hdr_tail="${line:3}"
+				hdr_tail="${hdr_tail#"${hdr_tail%%[![:space:]]*}"}"
+				[[ $hdr_tail != \"* ]] && hdr_tail="${hdr_tail%%$'\t'*}"
+				checked_rel_path=""
+				check_patch_target_path "$hdr_tail" "true" "$target_dir" "$is_git_repo" "$is_symlink" "$created_syms" || return 1
+				if [[ -n $checked_rel_path ]]; then
+					cur_rel="$checked_rel_path"
+					[[ $is_symlink == "true" && $line == +++* ]] && created_syms+="${cur_rel}"$'\n'
+				fi
+				;;
+			'rename from '* | 'rename to '* | 'copy from '* | 'copy to '*)
+				hdr_tail="${line#* }"
+				hdr_tail="${hdr_tail#* }"
+				check_patch_target_path "$hdr_tail" "false" "$target_dir" "$is_git_repo" "$is_symlink" "$created_syms" || return 1
+				;;
+		esac
+	done < "$patch_file"
+
+	return 0
 }
 
 # Attempt git apply --3way transactionally so failed merges (or dry-run checks)
-# never leave conflict markers, partial multi-file changes, or dirty index entries,
-# while preserving any prior uncommitted modifications in the working tree.
+# never leave conflict markers, partial multi-file changes, orphaned directories,
+# or dirty index entries, while preserving prior uncommitted modifications.
 git_try_3way() {
 	local git_repo="$1"
 	local patch_file="$2"
 	local dry_run="$3"
+	local force="${4:-false}"
 
 	local -a paths=() existed_paths=() created_paths=()
+	local -A seen_paths=()
 	local rec p
 	while IFS= read -r -d '' rec; do
 		if [[ $rec == *$'\t'* ]]; then
 			p="${rec#*$'\t'}"
 			p="${p#*$'\t'}"
-			[[ -n $p ]] && paths+=("$p")
-		elif [[ -n $rec ]]; then
-			paths+=("$rec")
+		else
+			p="$rec"
+		fi
+		if [[ -n $p && -z ${seen_paths[$p]:-} ]]; then
+			seen_paths[$p]=1
+			paths+=("$p")
 		fi
 	done < <(git -C "$git_repo" apply --numstat -z -- "$patch_file" 2> /dev/null)
 
@@ -58,8 +255,9 @@ git_try_3way() {
 		}
 	fi
 
+	local missing_root parent_rel
 	for p in "${paths[@]}"; do
-		if [[ $p == /* || $p == *..* ]]; then
+		if [[ $p == /* || $p == ".." || $p == ../* || $p == */../* || $p == */.. ]]; then
 			rm -rf -- "$snap_dir"
 			return 1
 		fi
@@ -71,12 +269,23 @@ git_try_3way() {
 			}
 			existed_paths+=("$p")
 		else
-			created_paths+=("$p")
+			missing_root="$p"
+			while [[ $missing_root == */* ]]; do
+				parent_rel="${missing_root%/*}"
+				if [[ -e "$git_repo/$parent_rel" || -L "$git_repo/$parent_rel" ]]; then
+					break
+				fi
+				missing_root="$parent_rel"
+			done
+			created_paths+=("$missing_root")
 		fi
 	done
 
+	local -a git_3way_args=(--3way)
+	[[ $force == "true" ]] && git_3way_args+=(--ignore-whitespace)
+
 	local apply_rc=0
-	git -C "$git_repo" apply --3way -- "$patch_file" > /dev/null 2>&1 || apply_rc=$?
+	git -C "$git_repo" apply "${git_3way_args[@]}" -- "$patch_file" > /dev/null 2>&1 || apply_rc=$?
 
 	if [[ $apply_rc -ne 0 || $dry_run == "true" ]]; then
 		if [[ -f "$snap_dir/index.bak" ]]; then
@@ -154,7 +363,7 @@ apply_patches() {
 			return 1
 		fi
 
-		if [[ -e $git_repo/.git ]] && command -v git > /dev/null 2>&1 && git -C "$git_repo" rev-parse --git-dir > /dev/null 2>&1; then
+		if is_git_repo_root "$git_repo"; then
 			is_git_repo="true"
 			printf '\n%b Target git repository: %b%s%b\n' "${unicode_blue_circle}" "${color_blue}" "$git_repo" "${color_end}"
 		else
@@ -163,7 +372,7 @@ apply_patches() {
 		fi
 	else
 		git_repo="${caller_dir}"
-		if [[ -e $git_repo/.git ]] && command -v git > /dev/null 2>&1 && git -C "$git_repo" rev-parse --git-dir > /dev/null 2>&1; then
+		if is_git_repo_root "$git_repo"; then
 			is_git_repo="true"
 		else
 			is_git_repo="false"
@@ -220,9 +429,18 @@ apply_patches() {
 		printf '\n%b Processing: %b%s%b\n' "${unicode_blue_circle}" "${color_cyan}" "$patch_name" "${color_end}"
 
 		local error_message=""
+		local patch_security_error=""
 
-		if patch_has_path_traversal "$patch_file"; then
-			error_message="Security: patch contains parent directory traversal ('..')"
+		if [[ ! -s $patch_file ]]; then
+			error_message="Patch file is empty"
+			printf '  %b %bFailed%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
+			printf '  %b %bReason:%b\n      %s\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}" "$error_message"
+			failed_patches+=("$patch_name")
+			continue
+		fi
+
+		if ! validate_patch_security "$patch_file" "$git_repo" "$is_git_repo"; then
+			error_message="$patch_security_error"
 			printf '  %b %bFailed%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
 			printf '  %b %bReason:%b\n      %s\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}" "$error_message"
 			failed_patches+=("$patch_name")
@@ -235,14 +453,18 @@ apply_patches() {
 					printf '\n  %b %bOK%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 				elif [[ $force == "true" ]] && git -C "$git_repo" apply --check --ignore-whitespace -- "$patch_file" 2> /dev/null; then
 					printf '\n  %b %bOK (ignored whitespace)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
-				elif git_try_3way "$git_repo" "$patch_file" "true"; then
+				elif git_try_3way "$git_repo" "$patch_file" "true" "$force"; then
 					printf '\n  %b %bOK (3-way merge)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 				else
 					printf '  %b %bFailed%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
 					failed_patches+=("$patch_name")
-					[[ $verbose != "true" ]] && error_message="${error_message%%$'\n'*}"
+					if [[ $verbose == "true" ]]; then
+						error_message=$(git -C "$git_repo" apply --check --verbose -- "$patch_file" 2>&1)
+					else
+						error_message="${error_message%%$'\n'*}"
+					fi
 					printf '  %b %bReason:%b\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}"
-					printf '%s\n' "$error_message" | sed 's/^/      /'
+					printf '      %s\n' "${error_message//$'\n'/$'\n      '}"
 				fi
 			else
 				# Use patch command in batch/forward mode for non-git directories
@@ -255,11 +477,12 @@ apply_patches() {
 					failed_patches+=("$patch_name")
 					[[ $verbose != "true" ]] && error_message="${error_message%%$'\n'*}"
 					printf '  %b %bReason:%b\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}"
-					printf '%s\n' "$error_message" | sed 's/^/      /'
+					printf '      %s\n' "${error_message//$'\n'/$'\n      '}"
 				fi
 			fi
 		else
 			local applied="false"
+			local apply_err=""
 
 			if [[ $is_git_repo == "true" ]]; then
 				# Git repository - use transactional 3-way merge fallback so failed merges never dirty index/worktree
@@ -267,28 +490,34 @@ apply_patches() {
 					printf '\n  %b %bApplied%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
-				elif [[ $force == "true" ]] && git -C "$git_repo" apply --ignore-whitespace -- "$patch_file" 2> /dev/null; then
+				elif [[ $force == "true" ]] && apply_err=$(git -C "$git_repo" apply --ignore-whitespace -- "$patch_file" 2>&1); then
 					printf '  %b %bApplied (ignored whitespace)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
-				elif git_try_3way "$git_repo" "$patch_file" "false"; then
+				elif git_try_3way "$git_repo" "$patch_file" "false" "$force"; then
 					printf '  %b %bApplied with 3-way merge%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
 				fi
 			else
 				# Non-git directory - verify with --dry-run first and suppress .orig/.rej files
-				if error_message=$(patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --dry-run -p1 -i "$patch_file" 2>&1) \
-					&& patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - -p1 -i "$patch_file" > /dev/null 2>&1; then
-					printf '\n  %b %bApplied%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
-					applied="true"
-					error_message=""
+				if error_message=$(patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --dry-run -p1 -i "$patch_file" 2>&1); then
+					if apply_err=$(patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - -p1 -i "$patch_file" 2>&1); then
+						printf '\n  %b %bApplied%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
+						applied="true"
+						error_message=""
+					else
+						error_message="$apply_err"
+					fi
 				elif [[ $force == "true" ]] \
-					&& patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --ignore-whitespace --dry-run -p1 -i "$patch_file" > /dev/null 2>&1 \
-					&& patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --ignore-whitespace -p1 -i "$patch_file" > /dev/null 2>&1; then
-					printf '  %b %bApplied (ignored whitespace)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
-					applied="true"
-					error_message=""
+					&& patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --ignore-whitespace --dry-run -p1 -i "$patch_file" > /dev/null 2>&1; then
+					if apply_err=$(patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --ignore-whitespace -p1 -i "$patch_file" 2>&1); then
+						printf '  %b %bApplied (ignored whitespace)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
+						applied="true"
+						error_message=""
+					else
+						error_message="$apply_err"
+					fi
 				fi
 			fi
 
@@ -296,17 +525,18 @@ apply_patches() {
 				local reason_summary="${error_message%%$'\n'*}"
 				printf '\n  %b %bFailed to apply%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
 				printf '  %b %bReason:%b\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}"
-				printf '%s\n' "$reason_summary" | sed 's/^/      /'
+				printf '      %s\n' "$reason_summary"
 				failed_patches+=("$patch_name")
 				if [[ $verbose == "true" ]]; then
-					local quoted_patch quoted_repo
+					local quoted_patch quoted_repo detail_msg
 					printf -v quoted_patch '%q' "$patch_file"
 					printf -v quoted_repo '%q' "$git_repo"
 					printf '\n%b%s%b\n' "${color_yellow}" "    Detailed error:" "${color_end}"
 					if [[ $is_git_repo == "true" ]]; then
-						git -C "$git_repo" apply --check --verbose -- "$patch_file" 2>&1 | sed 's/^/      /'
+						detail_msg=$(git -C "$git_repo" apply --check --verbose -- "$patch_file" 2>&1)
+						printf '      %s\n' "${detail_msg//$'\n'/$'\n      '}"
 					else
-						printf '%s\n' "$error_message" | sed 's/^/      /'
+						printf '      %s\n' "${error_message//$'\n'/$'\n      '}"
 					fi
 					printf '\n%b     To fix this patch, try one of these approaches: %b\n' "${color_yellow}" "${color_end}"
 					if [[ $is_git_repo == "true" ]]; then
@@ -334,9 +564,11 @@ apply_patches() {
 			output_file="${caller_dir}/${failed_patches_file}"
 		fi
 
-		if [[ ${#failed_patches[@]} -gt 0 ]]; then
+		if [[ -L $output_file ]]; then
+			printf '%b %b%s%b\n' "${unicode_yellow_circle}" "${color_yellow}" "Warning: Refusing to write failed patches to symbolic link" "${color_end}" >&2
+		elif [[ ${#failed_patches[@]} -gt 0 ]]; then
 			printf '\n%b Saving %b%d%b failed patch file names to: %b%s%b\n' "${unicode_blue_circle}" "${color_yellow}" "${#failed_patches[@]}" "${color_end}" "${color_blue}" "$output_file" "${color_end}"
-			if printf '%s\n' "${failed_patches[@]}" > "$output_file"; then
+			if { printf '%s\n' "${failed_patches[@]}" > "$output_file"; } 2> /dev/null; then
 				printf '%b %b%s%b\n' "${unicode_green_circle}" "${color_green}" "Failed patches saved successfully" "${color_end}"
 			else
 				printf '%b %b%s%b\n' "${unicode_yellow_circle}" "${color_yellow}" "Warning: Failed to save failed patches to file" "${color_end}" >&2
@@ -355,7 +587,7 @@ apply_patches() {
 		for patch_name in "${failed_patches[@]}"; do
 			local patch_path="$patch_dir/$patch_name"
 			if [[ -f $patch_path ]]; then
-				if rm -- "$patch_path" 2> /dev/null; then
+				if rm -f -- "$patch_path" 2> /dev/null; then
 					printf '  %b %bDeleted:%b %b%s%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}" "${color_cyan}" "$patch_name" "${color_end}"
 					((++deleted_count))
 				else
@@ -431,7 +663,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 				delete_failed_patches="true"
 				shift
 				;;
-			-[davfx][davfx]*)
+			-[davfx]?*)
 				flag_cluster="${1#-}"
 				while [[ -n $flag_cluster ]]; do
 					case "${flag_cluster:0:1}" in
@@ -470,13 +702,6 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 			-s | --save-failed)
 				if [[ $# -ge 2 && -n ${2:-} && $2 != -* ]]; then
 					failed_patches_file="$2"
-					if [[ $2 == */* ]]; then
-						save_parent="${2%/*}"
-						[[ -z $save_parent ]] && save_parent="/"
-						if [[ ! -d $save_parent ]]; then
-							printf '\n%b%s%b\n' "${color_yellow}" "Warning: Directory '$save_parent' does not exist" "${color_end}" >&2
-						fi
-					fi
 					shift 2
 				else
 					printf '\n%b%s%b\n' "${color_red}" "Error: --save-failed requires a file path argument" "${color_end}" >&2
@@ -488,13 +713,6 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 				if [[ -z $failed_patches_file ]]; then
 					printf '\n%b%s%b\n' "${color_red}" "Error: --save-failed requires a file path argument" "${color_end}" >&2
 					exit 1
-				fi
-				if [[ $failed_patches_file == */* ]]; then
-					save_parent="${failed_patches_file%/*}"
-					[[ -z $save_parent ]] && save_parent="/"
-					if [[ ! -d $save_parent ]]; then
-						printf '\n%b%s%b\n' "${color_yellow}" "Warning: Directory '$save_parent' does not exist" "${color_end}" >&2
-					fi
 				fi
 				shift
 				;;
@@ -517,7 +735,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 				printf '\n%b%s%b\n' "${color_gray}" "  -d, --dry-run            Only check patches without applying them (default)" "${color_end}"
 				printf '\n%b%s%b\n' "${color_gray}" "  -a, --apply              Actually apply patches (overrides default dry run)" "${color_end}"
 				printf '\n%b%s%b\n' "${color_gray}" "  -v, --verbose            Show detailed output for debugging" "${color_end}"
-				printf '\n%b%s%b\n' "${color_gray}" "  -f, --force              Try harder to apply patches (ignore whitespace, force through hunks)" "${color_end}"
+				printf '\n%b%s%b\n' "${color_gray}" "  -f, --force              Try harder to apply patches (ignore whitespace)" "${color_end}"
 				printf '\n%b%s%b\n' "${color_gray}" "  -r, --repo DIR           Target directory to apply patches to (git repo or regular directory)" "${color_end}"
 				printf '\n%b%s%b\n' "${color_gray}" "  -s, --save-failed FILE   Save failed patch file names to specified file" "${color_end}"
 				printf '\n%b%s%b\n' "${color_gray}" "  -x, --delete-failed      Delete failed patch files from patch directory" "${color_end}"
@@ -570,6 +788,15 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 				;;
 		esac
 	done
+
+	# Warn early if --save-failed parent directory does not exist
+	if [[ -n $failed_patches_file && $failed_patches_file == */* ]]; then
+		save_parent="${failed_patches_file%/*}"
+		[[ -z $save_parent ]] && save_parent="/"
+		if [[ ! -d $save_parent ]]; then
+			printf '\n%b%s%b\n' "${color_yellow}" "Warning: Directory '$save_parent' does not exist" "${color_end}" >&2
+		fi
+	fi
 
 	# Set default patch directory if not specified
 	if [[ -z $patch_dir ]]; then
