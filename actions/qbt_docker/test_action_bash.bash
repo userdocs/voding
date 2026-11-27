@@ -612,6 +612,14 @@ invoke_script \
 	MOCK_BUILDX_JSON='{"name":"docker.io/library/debian@sha256:deadbeef","image":{"config":{"Labels":{}}}}'
 assert_dockerfile "official .name with @sha256 digest -> apt-get" "apt-get"
 
+# Multi-arch Buildx JSON selects target $inputs_platform manifest when platforms differ
+invoke_script \
+	inputs_os_id="ghcr.io/userdocs/qbt-nox" \
+	inputs_os_version_id="latest" \
+	inputs_platform="linux/arm64" \
+	MOCK_BUILDX_JSON='{"image":{"linux/amd64":{"config":{"Labels":{"org.opencontainers.image.base.id":"alpine"}}},"linux/arm64":{"config":{"Labels":{"org.opencontainers.image.base.id":"debian"}}}}}'
+assert_dockerfile "multi-arch Buildx JSON selects matching inputs_platform (linux/arm64 -> debian)" "apt-get update"
+
 #─────────────────────────────────────────────────────
 section "Additional Apps in Dockerfile"
 #─────────────────────────────────────────────────────
@@ -936,6 +944,18 @@ else
 	_fail "-e secret value leaked on docker run failure" "$(last_output)"
 fi
 
+# --env value containing unsafe $var is blocked AND its secret value is redacted on stderr
+# shellcheck disable=SC2016
+run_test '--env secret containing unsafe $ expansion exits 1' 1 \
+	inputs_custom_docker_commands='--env DB_PASS=top_secret_pw$bad'
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" '--env blocked $ expansion redacts secret value in error output'
+if grep -qF "DB_PASS=<redacted>" "${tmp_dir}/last_output" \
+	&& ! grep -qF "top_secret_pw" "${tmp_dir}/last_output"; then
+	_pass
+else
+	_fail '--env $ expansion error leaked plaintext secret' "$(last_output)"
+fi
+
 run_test "extra flag smuggled on --volume line exits 1" 1 \
 	inputs_custom_docker_commands="--volume /tmp:/tmp --privileged"
 
@@ -1033,6 +1053,42 @@ assert_gh_output "path-traversing WORKDIR retains default wd=/home/gh" "wd=/home
 printf 'FROM alpine:edge\nWORKDIR /opt\nWORKDIR app\n' > "${_ws_df}/relwd.Dockerfile"
 invoke_script --workspace "$_ws_df" inputs_dockerfile="relwd.Dockerfile"
 assert_gh_output "sequential relative WORKDIR resolves to /opt/app" "wd=/opt/app"
+
+# Dot segments in WORKDIR (/opt/./app and WORKDIR .) normalize cleanly
+printf 'FROM alpine:edge\nWORKDIR /opt/./app\nWORKDIR .\n' > "${_ws_df}/dotwd.Dockerfile"
+invoke_script --workspace "$_ws_df" inputs_dockerfile="dotwd.Dockerfile"
+assert_gh_output "dot segments in WORKDIR normalize to /opt/app" "wd=/opt/app"
+
+# Fast-path WORKDIR / with $wd:/host fails validation cleanly without leaving temp Dockerfile behind
+_ws_rootwd="${tmp_dir}/ws_rootwd"
+mkdir -p "$_ws_rootwd"
+printf 'FROM alpine:edge\nWORKDIR .\n' > "${_ws_rootwd}/root.Dockerfile"
+# shellcheck disable=SC2016
+run_test 'WORKDIR . (/) with --volume $wd:/host exits 1' 1 \
+	--workspace "$_ws_rootwd" \
+	inputs_dockerfile="root.Dockerfile" \
+	inputs_custom_docker_commands='--volume $wd:/host'
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" 'rejected post-WORKDIR custom command leaves no temp Dockerfile'
+if [[ ! -e "${_ws_rootwd}/qbt_builder_dockerfile" ]]; then
+	_pass
+else
+	_fail "temp Dockerfile left behind after post-WORKDIR validation failure" ""
+fi
+
+# Pre-existing symlink at qbt_builder_dockerfile pointing to inputs_dockerfile is replaced and cleaned up without deleting source
+_ws_sym_self="${tmp_dir}/ws_sym_self"
+mkdir -p "$_ws_sym_self"
+printf 'FROM alpine:edge\nWORKDIR /sym_self\n' > "${_ws_sym_self}/real.Dockerfile"
+ln -sf "${_ws_sym_self}/real.Dockerfile" "${_ws_sym_self}/qbt_builder_dockerfile"
+run_test "pre-existing symlink at qbt_builder_dockerfile -> real.Dockerfile succeeds" 0 \
+	--workspace "$_ws_sym_self" \
+	inputs_dockerfile="real.Dockerfile"
+printf '[%d] %s\n' "$((pass_count + fail_count + 1))" "pre-existing qbt_builder_dockerfile symlink removed while real.Dockerfile preserved"
+if [[ -s "${_ws_sym_self}/real.Dockerfile" && ! -e "${_ws_sym_self}/qbt_builder_dockerfile" ]]; then
+	_pass
+else
+	_fail "real.Dockerfile lost or symlink left behind" ""
+fi
 
 # Multi-stage Dockerfile without WORKDIR in final stage does not leak builder WORKDIR
 printf 'FROM alpine:edge AS builder\nWORKDIR /tmp/stage1\nFROM alpine:edge\nRUN true\n' > "${_ws_df}/multistage_none.Dockerfile"

@@ -428,6 +428,10 @@ detect_image_os() {
 	printf '%s' "$detected_os"
 }
 
+# jq expression selecting the matching platform image object (or first valid platform) from buildx imagetools JSON
+# shellcheck disable=SC2016
+_jq_image_selector='(.image | if type == "object" and (has("config") or has("history")) then . elif ($plat != "" and (.[$plat] | type == "object" and (has("config") or has("history")))) then .[$plat] else ([.[]? | select(type == "object" and (has("config") or has("history")))][0] // {}) end)'
+
 # Section 1: GHCR userdocs-specific metadata parsing
 detect_os_userdocs() {
 	local LC_ALL=C
@@ -436,12 +440,12 @@ detect_os_userdocs() {
 
 	log_debug "Checking for GHCR userdocs metadata" >&2
 
-	# Support single-arch (.image.config.Labels) and multi-arch (.image[platform].config.Labels), skipping empty attestation entries
-	local labels_query='((.image | if type == "object" and (has("config") or has("history")) then . else ([.[]? | select(type == "object" and (has("config") or has("history")))][0] // {}) end).config.Labels // {})'
+	# Support single-arch and multi-arch schemas (preferring target $inputs_platform), skipping empty attestation entries
+	local labels_query="(${_jq_image_selector}.config.Labels // {})"
 	local base_id
 	local base_name
-	base_id=$(jq -r "try (${labels_query}.\"org.opencontainers.image.base.id\" // \"\")" <<< "$docker_inspect_json" 2> /dev/null)
-	base_name=$(jq -r "try (${labels_query}.\"org.opencontainers.image.base.name\" // \"\")" <<< "$docker_inspect_json" 2> /dev/null)
+	base_id=$(jq -r --arg plat "${inputs_platform:-}" "try (${labels_query}.\"org.opencontainers.image.base.id\" // \"\")" <<< "$docker_inspect_json" 2> /dev/null)
+	base_name=$(jq -r --arg plat "${inputs_platform:-}" "try (${labels_query}.\"org.opencontainers.image.base.name\" // \"\")" <<< "$docker_inspect_json" 2> /dev/null)
 
 	if [[ -n $base_id && $base_id != "null" ]]; then
 		log_debug "Found userdocs base.id: $base_id" >&2
@@ -490,9 +494,9 @@ detect_os_official() {
 	log_debug "Checking for official Docker image patterns" >&2
 
 	# Check URL metadata for official Docker images
-	local labels_query='((.image | if type == "object" and (has("config") or has("history")) then . else ([.[]? | select(type == "object" and (has("config") or has("history")))][0] // {}) end).config.Labels // {})'
+	local labels_query="(${_jq_image_selector}.config.Labels // {})"
 	local image_url
-	image_url=$(jq -r "try (${labels_query}.\"org.opencontainers.image.url\" // \"\")" <<< "$docker_inspect_json" 2> /dev/null)
+	image_url=$(jq -r --arg plat "${inputs_platform:-}" "try (${labels_query}.\"org.opencontainers.image.url\" // \"\")" <<< "$docker_inspect_json" 2> /dev/null)
 
 	if [[ -n $image_url && $image_url != "null" ]]; then
 		log_debug "Found image URL: $image_url" >&2
@@ -557,9 +561,8 @@ detect_os_fallback_with_metadata() {
 	log_debug "Using fallback detection with metadata" >&2
 
 	# Check history for OS hints (supports single-arch and multi-arch schemas; word-bounded to ignore DEBIAN_FRONTEND)
-	local image_query='(.image | if type == "object" and (has("config") or has("history")) then . else ([.[]? | select(type == "object" and (has("config") or has("history")))][0] // {}) end)'
 	local history_check
-	history_check=$(jq -r "try ((${image_query}.history // [])[].created_by // \"\")" <<< "$docker_inspect_json" 2> /dev/null | LC_ALL=C grep -i -E '(^|[^a-zA-Z0-9_])(alpine|debian|ubuntu)([^a-zA-Z0-9_]|$)' | head -1)
+	history_check=$(jq -r --arg plat "${inputs_platform:-}" "try ((${_jq_image_selector}.history // [])[].created_by // \"\")" <<< "$docker_inspect_json" 2> /dev/null | LC_ALL=C grep -i -E '(^|[^a-zA-Z0-9_])(alpine|debian|ubuntu)([^a-zA-Z0-9_]|$)' | head -1)
 
 	if [[ -n $history_check ]]; then
 		log_debug "Found OS in history: $history_check" >&2
@@ -875,9 +878,13 @@ parse_docker_commands() {
 				done
 			fi
 
-			# Block any remaining variable expansions or command substitutions
+			# Block any remaining variable expansions or command substitutions (redact -e/--env values)
 			if [[ $_val =~ [\$\`] ]]; then
-				log_error "Security: Command substitution or unsafe variable expansion blocked in: $_val"
+				if [[ $_flag == "-e" || $_flag == "--env" ]]; then
+					log_error "Security: Command substitution or unsafe variable expansion blocked in: $(redact_env_var "$_val")"
+				else
+					log_error "Security: Command substitution or unsafe variable expansion blocked in: $_val"
+				fi
 				exit 1
 			fi
 
@@ -1027,6 +1034,11 @@ extract_dockerfile_workdir() {
 				while [[ $stage_wd == *//* ]]; do
 					stage_wd="${stage_wd//\/\//\/}"
 				done
+				while [[ $stage_wd == */./* ]]; do
+					stage_wd="${stage_wd//\/.\//\/}"
+				done
+				[[ $stage_wd == */. ]] && stage_wd="${stage_wd%/.}"
+				[[ -z $stage_wd ]] && stage_wd="/"
 				[[ $stage_wd != "/" ]] && stage_wd="${stage_wd%/}"
 				if [[ ${#stage_wd} -gt 256 ]]; then
 					stage_invalid="$stage_wd"
@@ -1332,7 +1344,18 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 					log_error "Dockerfile not found at '$workspace/$inputs_dockerfile'"
 					exit 1
 				fi
-				if [[ ! "$workspace/$inputs_dockerfile" -ef $dockerfile_path ]]; then
+				if [[ ! -s "$workspace/$inputs_dockerfile" ]]; then
+					log_error "Dockerfile is empty or missing after fetch: $workspace/$inputs_dockerfile"
+					exit 1
+				fi
+				# Resolve final-stage WORKDIR and re-validate custom commands before creating temp Dockerfile
+				if extracted_wd=$(extract_dockerfile_workdir "$workspace/$inputs_dockerfile") && [[ -n $extracted_wd ]]; then
+					wd="$extracted_wd"
+					if [[ -n $inputs_custom_docker_commands ]]; then
+						parse_docker_commands
+					fi
+				fi
+				if [[ -L $dockerfile_path ]] || [[ ! "$workspace/$inputs_dockerfile" -ef $dockerfile_path ]]; then
 					if [[ -d $dockerfile_path && ! -L $dockerfile_path ]]; then
 						log_error "Failed to copy Dockerfile: destination is a directory: $dockerfile_path"
 						exit 1
@@ -1351,14 +1374,6 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 			log_error "Dockerfile is empty or missing after fetch: $dockerfile_path"
 			[[ $cleanup_dockerfile == true ]] && rm -f "$dockerfile_path"
 			exit 1
-		fi
-
-		# If the Dockerfile sets WORKDIR in its final stage, resolve it and re-expand custom commands
-		if extracted_wd=$(extract_dockerfile_workdir "$dockerfile_path") && [[ -n $extracted_wd ]]; then
-			wd="$extracted_wd"
-			if [[ -n $inputs_custom_docker_commands ]]; then
-				parse_docker_commands
-			fi
 		fi
 
 		# Write Dockerfile to stdout and step summary for visibility
