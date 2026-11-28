@@ -51,16 +51,40 @@ run_test() {
 	fi
 }
 
-# assert_output <name> <grep_pattern> <cmd> [args...]
+# assert_output <name> <grep_pattern> <cmd> [args...] (expects exit 0)
 assert_output() {
 	local name="$1"
 	local pattern="$2"
 	shift 2
 	((total_tests++))
 	printf '\n[%d] %s\n' "$total_tests" "$name"
-	local out
-	out=$("$@" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
-	if printf '%s' "$out" | grep -q -- "$pattern"; then
+	local raw out actual_exit
+	raw=$("$@" 2>&1)
+	actual_exit=$?
+	out=$(printf '%s' "$raw" | sed 's/\x1b\[[0-9;]*m//g')
+	if [[ $actual_exit -ne 0 ]]; then
+		_fail "expected exit 0, got $actual_exit"
+	elif printf '%s' "$out" | grep -q -- "$pattern"; then
+		_pass
+	else
+		_fail "output did not contain: $pattern"
+	fi
+}
+
+# assert_fail_output <name> <grep_pattern> <cmd> [args...] (expects exit 1)
+assert_fail_output() {
+	local name="$1"
+	local pattern="$2"
+	shift 2
+	((total_tests++))
+	printf '\n[%d] %s\n' "$total_tests" "$name"
+	local raw out actual_exit
+	raw=$("$@" 2>&1)
+	actual_exit=$?
+	out=$(printf '%s' "$raw" | sed 's/\x1b\[[0-9;]*m//g')
+	if [[ $actual_exit -ne 1 ]]; then
+		_fail "expected exit 1, got $actual_exit"
+	elif printf '%s' "$out" | grep -q -- "$pattern"; then
 		_pass
 	else
 		_fail "output did not contain: $pattern"
@@ -301,7 +325,7 @@ run_test ".diff extension recognised" 0 \
 # Verbose dry-run preserves multi-line reason; non-verbose truncates to 1 line
 target=$(make_target_dir "dr-verbose")
 patches=$(make_invalid_patches_dir "dp-verbose")
-assert_output "Verbose dry-run shows multi-line patch error details" "Perhaps you used the wrong -p" \
+assert_fail_output "Verbose dry-run shows multi-line patch error details" "Perhaps you used the wrong -p" \
 	"$patch_verify" -v -r "$target" "$patches"
 
 target=$(make_target_dir "dr-nonverbose")
@@ -392,7 +416,7 @@ run_test "Applying already-applied patch exits 1" 1 \
 # Verbose apply failure must show the 'Detailed error' diagnostic block
 target=$(make_target_dir "ap-verbose-detail")
 patches=$(make_invalid_patches_dir "dp-ap-verbose-detail")
-assert_output "Verbose apply failure shows 'Detailed error'" "Detailed error" \
+assert_fail_output "Verbose apply failure shows 'Detailed error'" "Detailed error" \
 	"$patch_verify" -a -v -r "$target" "$patches"
 
 # Non-verbose apply failure must NOT show the 'Detailed error' block
@@ -561,13 +585,13 @@ section "Source Guard"
 run_test "Sourcing defines apply_patches function" 0 \
 	bash -c "source \"$patch_verify\" && declare -f apply_patches > /dev/null"
 
-# Sourcing multiple times or alongside caller color variables must produce no readonly errors
-assert_not_output "Re-sourcing patch_verify produces no readonly errors" "readonly" \
-	bash -c "color_red='x'; source \"$patch_verify\" && source \"$patch_verify\" && color_red='y'"
+# Sourcing multiple times under set -e or alongside caller color variables must succeed with no stderr
+run_test "Re-sourcing patch_verify under set -e succeeds with no stderr" 0 \
+	bash -ec "color_red=x; err=\$({ source \"$patch_verify\" && source \"$patch_verify\" && color_red=y; } 2>&1); [[ -z \$err ]]"
 
-# Calling apply_patches when sourced must not leak internal helper state into global scope
-run_test "apply_patches does not leak internal security state globals" 0 \
-	bash -c "source \"$patch_verify\" && apply_patches \"$cwd_patches\" true false false \"$cwd_target\" '' false > /dev/null 2>&1 && [[ -z \${patch_security_error+x} && -z \${checked_rel_path+x} ]]"
+# Calling apply_patches when sourced must preserve caller IFS/LC_ALL and not leak helper globals
+run_test "apply_patches preserves caller IFS/LC_ALL and leaks no helper globals" 0 \
+	bash -c "source \"$patch_verify\" && IFS=':' && LC_ALL=C && apply_patches \"$cwd_patches\" true false false \"$cwd_target\" '' false > /dev/null 2>&1 && [[ \$IFS == ':' && -z \${patch_security_error+x} && -z \${checked_rel_path+x} ]]"
 
 section "Hardening, Security & Regression Tests"
 
@@ -630,7 +654,7 @@ empty_patch_target=$(make_target_dir "empty-file-target")
 empty_patch_dir="$tmp_dir/dp-empty-file"
 mkdir -p "$empty_patch_dir"
 : > "$empty_patch_dir/zero.patch"
-assert_output "Empty 0-byte patch rejected in non-git dry-run" "Patch file is empty" \
+assert_fail_output "Empty 0-byte patch rejected in non-git dry-run" "Patch file is empty" \
 	"$patch_verify" -r "$empty_patch_target" "$empty_patch_dir"
 run_test "Empty 0-byte patch exits 1 in non-git apply mode" 1 \
 	"$patch_verify" -a -r "$empty_patch_target" "$empty_patch_dir"
@@ -672,7 +696,7 @@ run_test "Filename containing '..' (foo..bar.txt) applies cleanly" 0 \
 assert_file_contains "foo..bar.txt updated to v2" \
 	"$dotfile_target/foo..bar.txt" "^v2$"
 
-# Security: C-quoted octal path traversal (\056\056) blocked
+# Security: C-quoted octal path traversal (\056\056, plain and with tab timestamp) blocked
 octal_patches="$tmp_dir/dp-octal-trav"
 mkdir -p "$octal_patches"
 cat > "$octal_patches/octal.patch" << 'EOF'
@@ -683,14 +707,14 @@ diff --git "a/\056\056/outside_victim.txt" "b/\056\056/outside_victim.txt"
 -safe
 +pwned
 EOF
-assert_output "C-quoted octal '..' traversal blocked" "Security: patch contains parent directory traversal" \
+assert_fail_output "C-quoted octal '..' traversal blocked" "Security: patch contains parent directory traversal" \
 	"$patch_verify" -r "$trav_target" "$octal_patches"
 
 octal_ts_patches="$tmp_dir/dp-octal-ts-trav"
 mkdir -p "$octal_ts_patches"
 printf '%b' '--- "a/\\056\\056/outside_victim.txt"\t2026-01-01 00:00:00 +0000\n+++ "b/\\056\\056/outside_victim.txt"\t2026-01-01 00:00:00 +0000\n@@ -1 +1 @@\n-safe\n+pwned\n' \
 	> "$octal_ts_patches/octal_ts.patch"
-assert_output "C-quoted octal '..' header with tab timestamp blocked" "Security: patch contains parent directory traversal" \
+assert_fail_output "C-quoted octal '..' header with tab timestamp blocked" "Security: patch contains parent directory traversal" \
 	"$patch_verify" -r "$trav_target" "$octal_ts_patches"
 
 # Security: spoofed git 'rename to' traversal blocked
@@ -702,7 +726,7 @@ similarity index 100%
 rename from hello.c
 rename to ../outside_victim.txt
 EOF
-assert_output "Git 'rename to' traversal blocked" "Security: patch contains parent directory traversal" \
+assert_fail_output "Git 'rename to' traversal blocked" "Security: patch contains parent directory traversal" \
 	"$patch_verify" -r "$trav_target" "$rename_trav_patches"
 
 # Security: absolute target path in patch header blocked
@@ -715,7 +739,7 @@ cat > "$abs_patches/abs.patch" << EOF
 -safe
 +pwned
 EOF
-assert_output "Absolute path in patch header blocked" "Security: patch contains absolute target path" \
+assert_fail_output "Absolute path in patch header blocked" "Security: patch contains absolute target path" \
 	"$patch_verify" -r "$trav_target" "$abs_patches"
 
 # Security: escaping symlink patch (mode 120000) and symlink directory traversal blocked
@@ -729,7 +753,7 @@ cat > "$sym_via_dir_patches/via_sym.patch" << 'EOF'
 @@ -0,0 +1 @@
 +pwned
 EOF
-assert_output "New file via pre-existing symlink dir blocked in dry-run" "Security: patch target traverses symbolic link" \
+assert_fail_output "New file via pre-existing symlink dir blocked in dry-run" "Security: patch target traverses symbolic link" \
 	"$patch_verify" -r "$sym_target_dir" "$sym_via_dir_patches"
 run_test "New file via pre-existing symlink dir blocked in apply mode" 1 \
 	"$patch_verify" -a -r "$sym_target_dir" "$sym_via_dir_patches"
@@ -748,7 +772,7 @@ index 0000000..1234567
 +../outside_victim.txt
 \ No newline at end of file
 EOF
-assert_output "Escaping mode 120000 symlink blocked" "Security: patch creates escaping symbolic link" \
+assert_fail_output "Escaping mode 120000 symlink blocked" "Security: patch creates escaping symbolic link" \
 	"$patch_verify" -r "$trav_target" "$sym_mode_patches"
 
 sym_twostep_patches="$tmp_dir/dp-sym-twostep"
@@ -770,19 +794,22 @@ index 0000000..1234567
 @@ -0,0 +1 @@
 +hello
 EOF
-assert_output "Intra-patch 2-step symlink write blocked" "Security: patch target traverses symbolic link" \
+assert_fail_output "Intra-patch 2-step symlink write blocked" "Security: patch target traverses symbolic link" \
 	"$patch_verify" -r "$trav_target" "$sym_twostep_patches"
 
-# Security: --save-failed refuses to overwrite a symbolic link target
+# Security: --save-failed refuses to overwrite symbolic links or non-regular files
 sym_save_victim="$tmp_dir/sym-save-victim.txt"
 printf 'keep_safe' > "$sym_save_victim"
 sym_save_link="$tmp_dir/sym-save-link.txt"
 ln -s "$sym_save_victim" "$sym_save_link"
 sym_save_patches=$(make_invalid_patches_dir "dp-sym-save")
-assert_output "--save-failed warns and refuses symbolic link output" "Refusing to write failed patches to symbolic link" \
+assert_fail_output "--save-failed warns and refuses symbolic link output" "Refusing to write failed patches to symbolic link" \
 	"$patch_verify" -r "$trav_target" -s "$sym_save_link" "$sym_save_patches"
 assert_file_unchanged "--save-failed symlink target left untouched" \
 	"$sym_save_victim" "keep_safe"
+
+assert_fail_output "--save-failed warns and refuses directory output" "not a regular file" \
+	"$patch_verify" -r "$trav_target" -s "$tmp_dir" "$sym_save_patches"
 
 # --delete-failed (-x) deletes read-only (0444) failing patch without hanging
 ro_del_patches="$tmp_dir/dp-ro-del"
@@ -794,16 +821,31 @@ run_test "--delete-failed removes mode 0444 failing patch cleanly" 1 \
 assert_file_absent "Read-only failing patch deleted by -x" \
 	"$ro_del_patches/ro_invalid.patch"
 
-# Non-git apply failure after dry-run passes reports actual apply error (not 'checking file')
+# Unreadable patch file and non-git read-only target handling (when non-root)
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+	unread_patches="$tmp_dir/dp-unreadable"
+	mkdir -p "$unread_patches"
+	cp "$script_dir/patches/valid.patch" "$unread_patches/unreadable.patch"
+	chmod 0000 "$unread_patches/unreadable.patch"
+	assert_fail_output "Unreadable patch file fails with clear reason" "Patch file is not readable" \
+		"$patch_verify" -r "$trav_target" "$unread_patches"
+	chmod 0644 "$unread_patches/unreadable.patch"
+
 	ro_target=$(make_target_dir "ro-apply-target")
 	ro_patches=$(make_valid_patches_dir "dp-ro-apply")
 	chmod 0444 "$ro_target/hello.c"
 	chmod 0555 "$ro_target"
-	assert_not_output "Read-only target apply failure does not report dry-run 'checking file'" "checking file" \
-		"$patch_verify" -a -r "$ro_target" "$ro_patches"
+	ro_out=$("$patch_verify" -a -r "$ro_target" "$ro_patches" 2>&1)
+	ro_rc=$?
 	chmod 0755 "$ro_target"
 	chmod 0644 "$ro_target/hello.c"
+	((total_tests++))
+	printf '\n[%d] %s\n' "$total_tests" "Read-only target apply fails without dry-run 'checking file' reason"
+	if [[ $ro_rc -eq 1 && $ro_out != *"checking file"* ]]; then
+		_pass
+	else
+		_fail "expected exit 1 without 'checking file' (got exit $ro_rc)"
+	fi
 fi
 
 # Stale --save-failed file is removed when a subsequent run has 0 failures
@@ -831,9 +873,7 @@ run_test "--save-failed=FILE syntax records failed patch" 1 \
 assert_file_contains "--save-failed=FILE wrote failed patch basename" \
 	"$combo_fail_file" "^invalid\.patch$"
 
-assert_output "Invalid flag inside 2-char short cluster reports offending flag" "Unknown option: -z (in -az)" \
-	"$patch_verify" -az "$combo_patches"
-run_test "Invalid flag inside combined short cluster exits 1" 1 \
+assert_fail_output "Invalid flag inside short cluster reports offending flag and exits 1" "Unknown option: -z (in -az)" \
 	"$patch_verify" -az "$combo_patches"
 
 if command -v git > /dev/null 2>&1; then

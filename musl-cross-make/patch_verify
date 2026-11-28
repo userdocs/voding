@@ -20,7 +20,7 @@ is_git_repo_root() {
 	[[ -e $dir/.git ]] && command -v git > /dev/null 2>&1 || return 1
 	local toplevel phys_dir
 	toplevel=$(git -C "$dir" rev-parse --show-toplevel 2> /dev/null) || return 1
-	phys_dir=$(cd "$dir" 2> /dev/null && pwd -P) || return 1
+	phys_dir=$(cd -P -- "$dir" 2> /dev/null && pwd -P) || return 1
 	[[ $toplevel == "$phys_dir" ]]
 }
 
@@ -52,7 +52,6 @@ check_patch_target_path() {
 		patch_security_error="Security: patch contains absolute target path"
 		return 1
 	fi
-
 	if [[ $raw_path == ".." || $raw_path == ../* || $raw_path == */../* || $raw_path == */.. ]]; then
 		patch_security_error="Security: patch contains parent directory traversal ('..')"
 		return 1
@@ -63,20 +62,19 @@ check_patch_target_path() {
 		[[ $raw_path == */* ]] || return 0
 		rel_path="${raw_path#*/}"
 	fi
-
-	if [[ -z $rel_path || $rel_path == /* || $rel_path == ".." || $rel_path == ../* || $rel_path == */../* || $rel_path == */.. ]]; then
-		patch_security_error="Security: patch contains parent directory traversal ('..')"
+	if [[ -z $rel_path || $rel_path == /* || $rel_path == */ ]]; then
+		patch_security_error="Security: patch contains invalid target path"
 		return 1
 	fi
 
 	checked_rel_path="$rel_path"
 
-	local rem="$rel_path" prefix="" seg
-	while [[ $rem == */* ]]; do
-		seg="${rem%%/*}"
-		rem="${rem#*/}"
-		[[ -z $seg || $seg == "." ]] && continue
-		prefix="${prefix:+$prefix/}$seg"
+	local -a segs=()
+	local prefix="" i
+	IFS='/' read -ra segs <<< "$rel_path"
+	for ((i = 0; i < ${#segs[@]} - 1; i++)); do
+		[[ -z ${segs[i]} || ${segs[i]} == "." ]] && continue
+		prefix="${prefix:+$prefix/}${segs[i]}"
 		if [[ $'\n'$created_syms == *$'\n'"$prefix"$'\n'* || -L "$target_dir/$prefix" ]]; then
 			patch_security_error="Security: patch target traverses symbolic link"
 			return 1
@@ -94,6 +92,7 @@ check_patch_target_path() {
 # Parse diff headers statefully (skipping hunk body lines) to reject path traversal,
 # absolute paths, and symlink escapes before invoking git/patch.
 validate_patch_security() {
+	local LC_ALL=C
 	local patch_file="$1"
 	local target_dir="$2"
 	local is_git_repo="$3"
@@ -129,19 +128,18 @@ validate_patch_security() {
 								patch_security_error="Security: patch creates escaping symbolic link"
 								return 1
 							fi
-							local depth=0 tmp_rel="$cur_rel" part
-							while [[ $tmp_rel == */* ]]; do
-								part="${tmp_rel%%/*}"
-								tmp_rel="${tmp_rel#*/}"
-								[[ -n $part && $part != "." ]] && ((++depth))
-							done
-							local tmp_sym="${sym_target}/"
-							while [[ -n $tmp_sym ]]; do
-								part="${tmp_sym%%/*}"
-								tmp_sym="${tmp_sym#*/}"
+							local depth=0 part
+							local -a parts=()
+							if [[ $cur_rel == */* ]]; then
+								IFS='/' read -ra parts <<< "${cur_rel%/*}"
+								for part in "${parts[@]}"; do
+									[[ -n $part && $part != "." ]] && ((++depth))
+								done
+							fi
+							IFS='/' read -ra parts <<< "$sym_target"
+							for part in "${parts[@]}"; do
 								if [[ $part == ".." ]]; then
-									((--depth))
-									if ((depth < 0)); then
+									if ((--depth < 0)); then
 										patch_security_error="Security: patch creates escaping symbolic link"
 										return 1
 									fi
@@ -247,6 +245,7 @@ git_try_3way() {
 
 	local snap_dir
 	snap_dir=$(mktemp -d) || return 1
+	mkdir -p -- "$snap_dir/files"
 
 	if [[ -f $index_path ]]; then
 		cp -pf -- "$index_path" "$snap_dir/index.bak" 2> /dev/null || {
@@ -262,7 +261,7 @@ git_try_3way() {
 			return 1
 		fi
 		if [[ -e "$git_repo/$p" || -L "$git_repo/$p" ]]; then
-			mkdir -p -- "$snap_dir/files/$(dirname "$p")"
+			[[ $p == */* ]] && mkdir -p -- "$snap_dir/files/${p%/*}"
 			cp -a -- "$git_repo/$p" "$snap_dir/files/$p" || {
 				rm -rf -- "$snap_dir"
 				return 1
@@ -297,7 +296,7 @@ git_try_3way() {
 			rm -rf -- "${git_repo:?}/${p:?}"
 		done
 		for p in "${existed_paths[@]}"; do
-			mkdir -p -- "$git_repo/$(dirname "$p")"
+			[[ $p == */* ]] && mkdir -p -- "$git_repo/${p%/*}"
 			rm -rf -- "${git_repo:?}/${p:?}"
 			cp -a -- "$snap_dir/files/$p" "$git_repo/$p"
 		done
@@ -308,6 +307,8 @@ git_try_3way() {
 }
 
 apply_patches() {
+	local LC_ALL=C
+	local IFS=$' \t\n'
 	local patch_dir="${1:-patches}"
 	local dry_run="${2:-false}"
 	local verbose="${3:-false}"
@@ -355,7 +356,7 @@ apply_patches() {
 	local is_git_repo="false"
 	if [[ -n $git_repo ]]; then
 		if [[ $git_repo != /* ]]; then
-			git_repo="${caller_dir}/${git_repo}"
+			git_repo="${caller_dir%/}/${git_repo}"
 		fi
 
 		if [[ ! -d $git_repo ]]; then
@@ -367,16 +368,11 @@ apply_patches() {
 			is_git_repo="true"
 			printf '\n%b Target git repository: %b%s%b\n' "${unicode_blue_circle}" "${color_blue}" "$git_repo" "${color_end}"
 		else
-			is_git_repo="false"
 			printf '\n%b Target directory (not a git repo): %b%s%b\n' "${unicode_blue_circle}" "${color_blue}" "$git_repo" "${color_end}"
 		fi
 	else
 		git_repo="${caller_dir}"
-		if is_git_repo_root "$git_repo"; then
-			is_git_repo="true"
-		else
-			is_git_repo="false"
-		fi
+		is_git_repo_root "$git_repo" && is_git_repo="true"
 	fi
 
 	# Verify required tool exists before processing patches (prevents false failures and -x mass deletion)
@@ -387,11 +383,15 @@ apply_patches() {
 
 	# If patch_dir is not an absolute path, make it relative to caller's directory
 	if [[ $patch_dir != /* ]]; then
-		patch_dir="${caller_dir}/${patch_dir}"
+		patch_dir="${caller_dir%/}/${patch_dir}"
 	fi
 
 	if [[ ! -d $patch_dir ]]; then
 		printf '\n%b Patch directory %b%s%b not found\n' "${unicode_red_circle}" "${color_blue}" "$patch_dir" "${color_end}" >&2
+		return 1
+	fi
+	if [[ ! -r $patch_dir || ! -x $patch_dir ]]; then
+		printf '\n%b Patch directory %b%s%b is not accessible\n' "${unicode_red_circle}" "${color_blue}" "$patch_dir" "${color_end}" >&2
 		return 1
 	fi
 
@@ -430,19 +430,19 @@ apply_patches() {
 
 		local error_message=""
 		local patch_security_error=""
+		local precheck_err=""
 
-		if [[ ! -s $patch_file ]]; then
-			error_message="Patch file is empty"
-			printf '  %b %bFailed%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
-			printf '  %b %bReason:%b\n      %s\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}" "$error_message"
-			failed_patches+=("$patch_name")
-			continue
+		if [[ ! -r $patch_file ]]; then
+			precheck_err="Patch file is not readable"
+		elif [[ ! -s $patch_file ]]; then
+			precheck_err="Patch file is empty"
+		elif ! validate_patch_security "$patch_file" "$git_repo" "$is_git_repo"; then
+			precheck_err="$patch_security_error"
 		fi
 
-		if ! validate_patch_security "$patch_file" "$git_repo" "$is_git_repo"; then
-			error_message="$patch_security_error"
+		if [[ -n $precheck_err ]]; then
 			printf '  %b %bFailed%b\n' "${unicode_red_circle}" "${color_red}" "${color_end}"
-			printf '  %b %bReason:%b\n      %s\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}" "$error_message"
+			printf '  %b %bReason:%b\n      %s\n' "${unicode_yellow_circle}" "${color_yellow}" "${color_end}" "$precheck_err"
 			failed_patches+=("$patch_name")
 			continue
 		fi
@@ -482,7 +482,6 @@ apply_patches() {
 			fi
 		else
 			local applied="false"
-			local apply_err=""
 
 			if [[ $is_git_repo == "true" ]]; then
 				# Git repository - use transactional 3-way merge fallback so failed merges never dirty index/worktree
@@ -490,7 +489,7 @@ apply_patches() {
 					printf '\n  %b %bApplied%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
-				elif [[ $force == "true" ]] && apply_err=$(git -C "$git_repo" apply --ignore-whitespace -- "$patch_file" 2>&1); then
+				elif [[ $force == "true" ]] && git -C "$git_repo" apply --ignore-whitespace -- "$patch_file" > /dev/null 2>&1; then
 					printf '  %b %bApplied (ignored whitespace)%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
 					applied="true"
 					error_message=""
@@ -501,6 +500,7 @@ apply_patches() {
 				fi
 			else
 				# Non-git directory - verify with --dry-run first and suppress .orig/.rej files
+				local apply_err=""
 				if error_message=$(patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - --dry-run -p1 -i "$patch_file" 2>&1); then
 					if apply_err=$(patch -d "$git_repo" --batch --forward --no-backup-if-mismatch -r - -p1 -i "$patch_file" 2>&1); then
 						printf '\n  %b %bApplied%b\n' "${unicode_green_circle}" "${color_green}" "${color_end}"
@@ -561,11 +561,13 @@ apply_patches() {
 	if [[ -n $failed_patches_file ]]; then
 		local output_file="$failed_patches_file"
 		if [[ $output_file != /* ]]; then
-			output_file="${caller_dir}/${failed_patches_file}"
+			output_file="${caller_dir%/}/${failed_patches_file}"
 		fi
 
 		if [[ -L $output_file ]]; then
 			printf '%b %b%s%b\n' "${unicode_yellow_circle}" "${color_yellow}" "Warning: Refusing to write failed patches to symbolic link" "${color_end}" >&2
+		elif [[ -e $output_file && ! -f $output_file && $output_file != "/dev/null" ]]; then
+			printf '%b %b%s%b\n' "${unicode_yellow_circle}" "${color_yellow}" "Warning: Failed patches output path is not a regular file" "${color_end}" >&2
 		elif [[ ${#failed_patches[@]} -gt 0 ]]; then
 			printf '\n%b Saving %b%d%b failed patch file names to: %b%s%b\n' "${unicode_blue_circle}" "${color_yellow}" "${#failed_patches[@]}" "${color_end}" "${color_blue}" "$output_file" "${color_end}"
 			if { printf '%s\n' "${failed_patches[@]}" > "$output_file"; } 2> /dev/null; then
